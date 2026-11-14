@@ -1,9 +1,11 @@
 .git
+.github/
 .gitignore
 .env
 *.md
 docs/
 deploy/
+dist/
 lanshare
 lanshare.exe
 *.out

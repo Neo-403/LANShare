@@ -1,0 +1,185 @@
+name: Build · Release · Docker
+
+# 每次触发都从当前源码重新构建（二进制 + 多架构镜像），不依赖任何本地产物。
+#
+# 触发与行为：
+#   push tag v*        → 交叉编译二进制 + 创建 GitHub Release + 推送镜像（版本标签 + latest）
+#   push main          → 交叉编译二进制（仅 artifact）+ 推送镜像（main / sha-xxxxxxx）
+#   workflow_dispatch  → 手动运行；填 version 可额外创建 Release，勾 push_latest 可打 latest
+#
+# 版本号来自 tag：必须 v 开头且符合语义化版本（vMAJOR.MINOR.PATCH），
+# 镜像标签由 type=semver 去掉 v 后生成；手动运行的 version 输入只影响 Release 名。
+# 详见 README「版本标签与发版」。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#   Secrets   DOCKERHUB_TOKEN      Docker Hub Access Token
+#   Variables DOCKERHUB_USERNAME   Docker Hub 用户名
+#   Variables DOCKERHUB_REPO       Docker Hub 仓库名（可选，默认 lanshare）
+# GHCR 无需额外配置：用内置 GITHUB_TOKEN 推到 ghcr.io/<当前仓库>，
+# 并用 org.opencontainers.image.source label 关联到本项目。
+# 未配置 Docker Hub 凭据时自动跳过该推送，GHCR 仍正常发布。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动发布的版本号（如 v1.0.0）；留空则不创建 Release'
+        required: false
+        default: ''
+      push_latest:
+        description: '额外打上 latest 标签'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write       # 创建 Release / tag
+  packages: write       # 推送 GHCR
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binaries:
+    name: 交叉编译二进制
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false      # 零第三方依赖，无 go.sum，跳过依赖缓存
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 交叉编译（Windows / Linux × 多架构）
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          build() {
+            local out="$1" goos="$2" goarch="$3" goarm="${4:-}"
+            echo "::group::build $out (GOOS=$goos GOARCH=$goarch GOARM=$goarm)"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" \
+              go build -trimpath -ldflags="-s -w" -o "dist/$out" .
+            echo "::endgroup::"
+          }
+          build lanshare-windows-amd64.exe windows amd64
+          build lanshare-windows-arm64.exe windows arm64
+          build lanshare-linux-amd64        linux   amd64
+          build lanshare-linux-arm64        linux   arm64
+          build lanshare-linux-armv7        linux   arm7
+          cd dist
+          sha256sum lanshare-* > SHA256SUMS.txt
+          ls -lh
+
+      - name: 校验产物
+        run: |
+          file dist/lanshare-*
+          go version -m dist/lanshare-linux-amd64 | grep -E 'GOOS|GOARCH|CGO_ENABLED'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lanshare-binaries
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: 发布 GitHub Release
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lanshare-binaries
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(inputs.version || github.ref_name, '-') }}
+
+  docker:
+    name: 多架构镜像 → GHCR + Docker Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析镜像目标与凭据
+        id: cfg
+        env:
+          DH_USER: ${{ vars.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DH_REPO: ${{ vars.DOCKERHUB_REPO }}
+        run: |
+          set -eu
+          ghcr="ghcr.io/${GITHUB_REPOSITORY,,}"
+          hub=false
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then hub=true; fi
+          echo "images<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$ghcr" >> "$GITHUB_OUTPUT"
+          if [ "$hub" = true ]; then
+            echo "docker.io/$DH_USER/${DH_REPO:-lanshare}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，跳过 Docker Hub 推送"
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "hub=$hub" >> "$GITHUB_OUTPUT"
+
+      # Dockerfile 的编译阶段跑在 BUILDPLATFORM 上交叉编译，QEMU 只用于
+      # 运行阶段的 apk add（目标架构），避免模拟整个 Go 工具链。
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 登录 Docker Hub
+        if: steps.cfg.outputs.hub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.cfg.outputs.images }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=LANShare - LAN / cross-network sharing tool
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.push_latest) }}
+
+      - name: 构建并推送多架构镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,6 +1,22 @@
 # LANShare · Nginx 反代示例（证书完全由 Nginx 提供，后端跑纯 HTTP）
 # 复制为实际站点配置，把 share.example.com 与证书路径换成自己的。
-# 后端：docker compose 映射的 127.0.0.1:8080（见 .env 的 HTTP_PORT）。
+# 后端固定是 127.0.0.1:8080：Docker 见 .env 的 HTTP_PORT；裸机见 README 第 5 节
+# 的 ./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy。
+#
+# 群晖 DSM 7 裸机部署要点（完整流程见 README 第 5 节）：
+#   - 本文件放 /etc/nginx/sites-enabled/lanshare.conf。该目录 include 任意 *.conf，
+#     重启 / DSM 升级不会被模板覆盖；不要手改 /etc/nginx/nginx.conf 或 UI 生成的
+#     server.ReverseProxy.conf。
+#   - 下面的 map 通常 DSM 已全局定义。先执行：
+#       sudo nginx -T -c /etc/nginx/nginx.conf.run 2>/dev/null | grep -n 'map \$http_upgrade'
+#     有输出 → 删掉本文件的 map，只保留 proxy_set_header Connection $connection_upgrade；
+#     无输出 → 把 map 单独放 /etc/nginx/conf.d/http.lanshare.conf（文件名必须 http.*.conf）。
+#     重复定义会让 nginx -t 报 duplicate "connection_upgrade" variable。
+#   - ssl_certificate / ssl_certificate_key 用群晖证书实际路径：
+#       sudo ls /usr/syno/etc/certificate/_archive/   → <ID>/fullchain.pem、<ID>/privkey.pem
+#   - 校验并生效（DSM 7 实际运行 nginx.conf.run，务必先 -t 再 reload）：
+#       sudo nginx -t -c /etc/nginx/nginx.conf.run
+#       sudo nginx -s reload -c /etc/nginx/nginx.conf.run
 
 map $http_upgrade $connection_upgrade {
     default upgrade;
