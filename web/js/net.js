@@ -1,4 +1,4 @@
-import { Emitter, utf8ToB64, b64ToUtf8, sleep } from './util.js';
+import { Emitter, utf8ToB64, b64ToUtf8, b64encode, sleep, RELAY_DATA_MAX } from './util.js';
 
 export class Net extends Emitter {
   constructor() {
@@ -52,4 +52,11 @@ export function relayCtrl(net, to, obj) {
 
 export function parseRelay(msg) {
   try { return JSON.parse(b64ToUtf8(msg.bin)); } catch { return null; }
+}
+
+// WS 兜底数据帧：无 TURN 时承载已加密的文件分片 / 直传帧，服务端仅内存透传。
+// 发送的是上层构造好的整帧（含帧头与 AES-GCM tag），中继链路不改变帧格式。
+export function relayData(net, to, kind, u8) {
+  if (!u8 || u8.byteLength > RELAY_DATA_MAX) return false;
+  return net.send({ t: 'relay_data', to, k: kind, bin: b64encode(u8) });
 }

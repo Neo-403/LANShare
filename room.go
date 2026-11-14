@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,11 @@ const (
 	passwordFails = 5
 	passwordLock  = 30 * time.Second
 	maxEncKeyLen  = 512 // 被包装的会话密钥（JSON 字符串）
+	// 无 coturn 时的 WS 兜底转发：控制帧仍保持 64KB，兜底帧共用 1000/s；文件分片另走
+	// relay_data，按 base64 文本长度限制（解码后不超过 192KB），并按字节配额限流。
+	relayMaxBytes     = 64 * 1024
+	relayDataMaxBytes = 256 * 1024
+	relayDataRawMax   = 192 * 1024
 )
 
 var nickAdj = []string{"蓝色", "银色", "轻快", "安静", "明亮", "温柔", "勇敢", "好奇", "悠闲", "清澈"}
@@ -79,20 +85,31 @@ func (l *limiter) allow(cost float64) bool {
 	return true
 }
 
+// relayDataLimiter 按配置创建每连接的中继字节配额限流器。
+// 返回 nil 表示不限速（默认），此时由 WS 背压与 relay_pause 负责流控。
+func relayDataLimiter(cfg Config) *limiter {
+	if cfg.RelayRateMB <= 0 {
+		return nil
+	}
+	kb := cfg.RelayRateMB * 1024
+	return newLimiter(kb, kb*2)
+}
+
 type Client struct {
-	id, nick   string
-	ws         *WS
-	hub        *Hub
-	ip         string // 出口 IP
-	lan        string // 客户端上报的私网 /24
-	netID      string // 用户绑定的网络标识
-	scope      string
-	room       string
-	send       chan []byte
-	done       chan struct{}
-	closeOnce  sync.Once
-	limit      *limiter
-	relayLimit *limiter
+	id, nick       string
+	ws             *WS
+	hub            *Hub
+	ip             string // 出口 IP
+	lan            string // 客户端上报的私网 /24
+	netID          string // 用户绑定的网络标识
+	scope          string
+	room           string
+	send           chan []byte
+	done           chan struct{}
+	closeOnce      sync.Once
+	limit          *limiter
+	relayLimit     *limiter
+	relayDataLimit *limiter // 可选：按 KB 计的字节配额，nil 表示不限速
 }
 
 func (c *Client) sendJSON(v any) bool {
@@ -133,13 +150,13 @@ type Room struct {
 	RID, Name, HostID, Salt, ScopeKey string
 	// Salt 是会话密钥的包装盐（前端生成），EncKey 是用密码 KEK 加密后的会话密钥密文。
 	// 服务端只存密文，永远拿不到会话密钥本身；改密码只是重新包装同一把密钥。
-	EncKey                           string
-	Private                          bool
-	PwdSalt, PwdHash                 []byte
-	Fails                            map[string]*failRec
-	Members                          map[string]*Member
-	Order                            []string
-	Created                          time.Time
+	EncKey           string
+	Private          bool
+	PwdSalt, PwdHash []byte
+	Fails            map[string]*failRec
+	Members          map[string]*Member
+	Order            []string
+	Created          time.Time
 }
 
 type Hub struct {
@@ -468,7 +485,7 @@ func (h *Hub) joinChallenge(c *Client, rid string) (private bool, salt, hash []b
 		return false, nil, nil, errf("not_found", "房间不存在或已解散")
 	}
 	if len(r.Order) >= h.cfg.MaxMembers {
-		return false, nil, nil, errf("room_full", "房间已满（最多 " + strconv.Itoa(h.cfg.MaxMembers) + " 人）")
+		return false, nil, nil, errf("room_full", "房间已满（最多 "+strconv.Itoa(h.cfg.MaxMembers)+" 人）")
 	}
 	if !r.Private {
 		return false, nil, nil, nil
@@ -556,9 +573,9 @@ func (h *Hub) announceJoin(c *Client, r *Room) {
 			"rid":      r.RID,
 			"name":     r.Name,
 			"private":  r.Private,
-			"salt":     r.Salt,     // 包装会话密钥用的 keySalt
-			"encKey":   r.EncKey,   // 私有房：用准入密码解包得到会话密钥；公开房为空
-			"nick":     c.nick,     // 服务端保证房间内唯一后的昵称
+			"salt":     r.Salt,   // 包装会话密钥用的 keySalt
+			"encKey":   r.EncKey, // 私有房：用准入密码解包得到会话密钥；公开房为空
+			"nick":     c.nick,   // 服务端保证房间内唯一后的昵称
 			"host":     r.HostID,
 			"peers":    peers,
 			"syncFrom": syncFrom,
@@ -743,19 +760,90 @@ func (h *Hub) signalTo(from *Client, toID string, data any) error {
 
 // relayTo 是 TURN 不可用时的最后兜底，仅在内存转发，绝不落盘。
 func (h *Hub) relayTo(from *Client, toID, bin string) error {
-	if len(bin) > 64*1024 {
+	if len(bin) > relayMaxBytes {
 		return errf("rate_limited", "relay 帧过大")
 	}
+	to, err := h.roomPeer(from, toID)
+	if err != nil {
+		return err
+	}
+	if !relayEnqueue(to, map[string]any{"t": "relay", "from": from.id, "bin": bin}) {
+		from.trySendJSON(map[string]any{"t": "relay_pause", "ms": 200})
+	}
+	return nil
+}
+
+// relayDataTo 在没有 TURN 时经 WS 转发文件分片 / 直传帧。服务端只透传 base64
+// 字符串，不解码业务内容、不缓存、不落盘；kind 白名单防止该通道被挪作它用。
+func (h *Hub) relayDataTo(from *Client, toID, kind, bin string) error {
+	if kind != "data" && kind != "direct" {
+		return errf("bad_frame", "非法的数据类型")
+	}
+	if len(bin) == 0 || len(bin) > relayDataMaxBytes || len(bin)%4 != 0 ||
+		base64.StdEncoding.DecodedLen(len(bin)) > relayDataRawMax {
+		return errf("bad_frame", "中继数据帧过大或格式非法")
+	}
+	to, err := h.roomPeer(from, toID)
+	if err != nil {
+		return err
+	}
+	if !relayEnqueue(to, map[string]any{"t": "relay_data", "from": from.id, "k": kind, "bin": bin}) {
+		// 接收端队列拥塞：给发送方一个短暂节流信号，避免持续冲刷把连接拖垮。
+		// 丢弃的这一片由文件层的位图 / 段重组重传机制补齐。
+		from.trySendJSON(map[string]any{"t": "relay_pause", "ms": 300})
+	}
+	return nil
+}
+
+// relayEnqueue 在全局锁之外入队。接收端较慢时先短暂等待其排空，仍放不下
+// 才丢弃该帧；绝不因为兜底帧直接关闭接收端连接（sendJSON 的满队列策略）。
+func relayEnqueue(to *Client, v any) bool {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	select {
+	case to.send <- b:
+		return true
+	case <-to.done:
+		return false
+	default:
+	}
+	t := time.NewTimer(time.Second)
+	defer t.Stop()
+	select {
+	case to.send <- b:
+		return true
+	case <-to.done:
+		return false
+	case <-t.C:
+		return false
+	}
+}
+
+// trySendJSON 用于尽力而为的节流通知：队列满时直接丢弃，不影响连接。
+func (c *Client) trySendJSON(v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- b:
+	default:
+	}
+}
+
+// roomPeer 校验发送方与接收方同属一个在线房间，供两种中继帧共用。
+func (h *Hub) roomPeer(from *Client, toID string) (*Client, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	r := h.rooms[from.room]
 	if r == nil {
-		return errf("not_in_room", "不在房间内")
+		return nil, errf("not_in_room", "不在房间内")
 	}
 	to := h.clients[toID]
 	if to == nil || to.room != r.RID {
-		return errf("not_found", "目标成员不在线")
+		return nil, errf("not_found", "目标成员不在线")
 	}
-	to.sendJSON(map[string]any{"t": "relay", "from": from.id, "bin": bin})
-	return nil
+	return to, nil
 }

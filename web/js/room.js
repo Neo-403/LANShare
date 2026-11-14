@@ -2,7 +2,7 @@ import {
   Emitter, MAX_HISTORY, MAX_HISTORY_BYTES, randHex, b64encode, b64decode,
   utf8ToB64, b64ToUtf8, splitByUtf8Bytes,
   MAX_TEXT_CHARS, TEXT_PART_BYTES, SYNC_PART_BYTES, MAX_TEXT_PARTS, MAX_SYNC_PARTS,
-  TEXT_PART_TTL_MS, MAX_TEXT_PENDING,
+  TEXT_PART_TTL_MS, MAX_TEXT_PENDING, NO_ICE_CONNECT_TIMEOUT_MS,
 } from './util.js';
 import { deriveRoomKey, importRoomKey, unwrapRoomKey } from './crypto.js';
 import { relayCtrl, parseRelay } from './net.js';
@@ -30,12 +30,21 @@ export class RoomState extends Emitter {
     this.expectedKeyFrom = '';  // 只接受指定 peer 下发的 key_sync
     this.keyRetry = 0;
     this.keyTimer = 0;
+    this.stalled = false;   // 仅无外部 ICE 服务器时使用的短超时标记
+    this.stallTimer = 0;
 
     mesh.on('ctrl', (from, obj) => this.onCtrl(from, obj).catch(e => console.warn('[room] ctrl', e)));
     mesh.on('ready', () => this.updateWsOnly());
     mesh.on('failed', () => this.updateWsOnly());
     // net 是全局单例，离房时必须注销，否则多次进出会累积监听器并误处理 relay 帧。
     this._offRelay = net.on('relay', m => this.onRelay(m).catch(e => console.warn('[room] relay', e)));
+    this._offRelayData = net.on('relay_data', m => {
+      if (!this.members.has(m.from)) return; // 拒绝非本房间成员注入数据
+      let u8;
+      try { u8 = b64decode(m.bin); } catch { return; }
+      this.mesh.relayIngest(m.from, m.k, u8);
+    });
+    this._offRelayPause = net.on('relay_pause', m => this.mesh.pauseRelay(m.ms));
   }
 
   init(joined) {
@@ -53,6 +62,7 @@ export class RoomState extends Emitter {
     for (const p of joined.peers || []) {
       this.members.set(p.id, { id: p.id, nick: p.nick, sameLan: p.sameLan });
     }
+    this.scheduleStall();
     this.emit('members', this.memberList());
   }
 
@@ -104,14 +114,15 @@ export class RoomState extends Emitter {
     const links = new Map(this.mesh.list().map(p => [p.id, p]));
     return [...this.members.values()].map(m => ({
       ...m,
-      link: m.self ? 'SELF' : (links.get(m.id)?.link || 'connecting'),
-      ready: m.self || !!links.get(m.id)?.ready,
+      link: m.self ? 'SELF' : (this.wsOnly ? 'RELAY' : (links.get(m.id)?.link || 'connecting')),
+      ready: m.self || this.wsOnly || !!links.get(m.id)?.ready,
     }));
   }
 
   addMember(peer) {
     this.members.set(peer.id, { id: peer.id, nick: peer.nick, sameLan: peer.sameLan });
     this.mesh.addPeer(peer.id, peer.nick, peer.sameLan);
+    this.scheduleStall();
     this.updateWsOnly();
     this.emit('members', this.memberList());
     this.emit('system', `${peer.nick} 加入了房间`);
@@ -138,12 +149,33 @@ export class RoomState extends Emitter {
     this.emit('members', this.memberList());
   }
 
+  // 模式由服务端下发的 ICE 配置决定：
+  //  - 未配置任何 STUN/TURN（noIceServers）：跨网不可能打洞，给内网直连留一个
+  //    短窗口，超时即切服务器中继，避免 ICE 长期停在 connecting 干等。
+  //  - 配置了 STUN/TURN：不启用抢跑定时器，完全交给 ICE 协商；只有 ICE 明确
+  //    失败（failed/disconnected/closed）才落到最后一档 WS 兜底。
+  scheduleStall() {
+    clearTimeout(this.stallTimer);
+    this.stalled = false;
+    if (!this.mesh.ice?.noIceServers) return;
+    this.stallTimer = setTimeout(() => {
+      this.stalled = true;
+      this.updateWsOnly();
+    }, NO_ICE_CONNECT_TIMEOUT_MS);
+  }
+
   updateWsOnly() {
     const peers = this.mesh.list();
-    const next = peers.length > 0 && peers.every(p => p.link === 'failed');
+    const down = peers.length > 0 && peers.every(p =>
+      p.link === 'failed' || p.link === 'disconnected' || p.link === 'closed');
+    const stalled = !!this.mesh.ice?.noIceServers && this.stalled &&
+      peers.length > 0 && peers.every(p => !p.ready);
+    const next = down || stalled;
     if (next !== this.wsOnly) {
       this.wsOnly = next;
+      this.mesh.setRelayMode(next);
       this.emit('wsonly', next);
+      this.emit('members', this.memberList());
     }
   }
 
@@ -384,6 +416,10 @@ export class RoomState extends Emitter {
 
   reset() {
     this._offRelay?.();
+    this._offRelayData?.();
+    this._offRelayPause?.();
+    clearTimeout(this.stallTimer);
+    this.stalled = false;
     this.mesh.closeAll();
     this.mesh.setKey(null);
     clearTimeout(this.keyTimer);

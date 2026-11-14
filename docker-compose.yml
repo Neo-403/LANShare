@@ -1,49 +1,70 @@
-name: lanshare
-
 services:
-  # 页面 + WS 信令。TLS 由宿主机 Nginx 终止，容器内只跑 HTTP。
-  lanshare:
-    build: .
-    image: lanshare:local
-    restart: unless-stopped
-    environment:
-      LANSHARE_ADDR: ":8080"
-      LANSHARE_NO_TLS: "1"
-      LANSHARE_TRUST_PROXY: "1"
-      LANSHARE_TURN_SECRET: ${TURN_SECRET:?请在 .env 中设置 TURN_SECRET}
-      LANSHARE_TURN_URLS: "turn:${PUBLIC_HOST:?请在 .env 中设置 PUBLIC_HOST}:3478?transport=udp,turn:${PUBLIC_HOST}:3478?transport=tcp"
-      LANSHARE_STUN_URLS: "stun:${PUBLIC_HOST}:3478,stun:stun.l.google.com:19302"
-    ports:
-      # 只绑定到本机回环，外部流量一律经 Nginx（HTTPS）
-      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
-    depends_on:
-      - coturn
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
+  # 只需 docker-compose.yml + .env 即可部署，不需要拉取仓库里的任何脚本或配置。
+  # 默认只需 .env（最小可只含 HTTP_PORT）；PUBLIC_HOST 与 TURN_* 仅启用可选 coturn 时才需要。
+  # ${PUBLIC_HOST}      # 公网域名或 IP（同时用作 TURN realm）
+  # ${TURN_SECRET}      # 可选 coturn 的共享密钥
+  # ${TURN_EXTERNAL_IP} # 可选 coturn 在 NAT 后时的外网 IP
+  # ${STUN_URLS}        # 留空 = 没有外部打洞服务器
+  # ${TURN_URLS}        # 留空 = 不下发外部 TURN
+  # STUN_URLS 与 TURN_URLS 都留空 = 直接启用 LANShare 自身的 WS 完整中继
+  lanshare:  # LANShare 服务（页面 + 信令 + 无 TURN 时的 WS 中继）
+    # image: 918178/lanshare  # Docker Hub 镜像
+    image: ghcr.io/neo-403/lanshare  # GHCR 镜像
+    restart: unless-stopped  # 非手动停止则总是重启
+    ports:  # 端口映射
+      - "8080:8080"  # 宿主机端口（由 Nginx 反代，不要直接对外）
+    environment:  # 环境变量
+      LANSHARE_ADDR: ":8080"  # 监听端口
+      LANSHARE_NO_TLS: "1"  # 禁用 TLS（由 Nginx 提供 HTTPS）
+      LANSHARE_TRUST_PROXY: "1"  # 允许外部代理
+      LANSHARE_TURN_SECRET: "${TURN_SECRET:-}"  # 仅启用可选 coturn 时需要
+      LANSHARE_TURN_URLS: "${TURN_URLS:-}"  # 留空 = 不下发外部 TURN
+      LANSHARE_STUN_URLS: "${STUN_URLS:-}"  # 留空 = 不打洞；两项都空时直接走服务器 WS 中继
+      LANSHARE_RELAY_RATE_MB: "${RELAY_RATE_MB:-0}"  # 每连接中继带宽上限(MB/s)，0 = 不限速
+    # healthcheck:  # 健康检查
+    #   test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]  # 访问 /health
+    #   interval: 30s  # 检查间隔
+    #   timeout: 3s  # 超时
+    #   retries: 3  # 重试次数
 
-  # 打洞服务（Q3）：STUN + TURN，凭据由 lanshare 用同一个 TURN_SECRET 临时签发。
-  coturn:
-    image: coturn/coturn:4.6.2
-    restart: unless-stopped
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      # 中继端口段收窄到 201 个，避免 Docker 生成上万条 iptables 规则；
-      # 10 人房间足够。裸机部署可改回 deploy/turnserver.conf 里的更大范围。
-      - "40000-40200:40000-40200/udp"
-    environment:
-      TURN_SECRET: ${TURN_SECRET:?请在 .env 中设置 TURN_SECRET}
-      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
-      PUBLIC_HOST: ${PUBLIC_HOST:?请在 .env 中设置 PUBLIC_HOST}
-    # 用独立脚本而非内联 shell：避免 compose 的 $$ 转义与 shellwords 拆分踩坑。
-    entrypoint: ["/bin/sh", "/entrypoint.sh"]
-    volumes:
-      - ./deploy/coturn-entrypoint.sh:/entrypoint.sh:ro
-    # Linux 上若不想映射 201 个 UDP 端口，可改为 network_mode: host（删掉上面 ports）。
-    # Windows / macOS 的 Docker Desktop 需开启 host networking 才能用该模式。
-
-# 若 Nginx 也要容器化，可自行加一个 service 挂载 deploy/nginx.conf.example 与证书目录；
-# 本 compose 默认对接宿主机 Nginx，证书完全由用户掌控。
+  # 可选：只有需要标准 TURN 中继（对称 NAT 且要求最高吞吐）时才启用。
+  # 启用方式：在 .env 里填 TURN_SECRET 与 TURN_URLS，然后
+  #   docker compose --profile turn up -d
+  # 默认的 docker compose up -d 不会启动本服务，也不需要开放任何 UDP 端口。
+  coturn:  # 打洞服务(STUN + TURN)
+    profiles: ["turn"]
+    image: coturn/coturn:4.6.2  # 镜像
+    restart: unless-stopped  # 非手动停止则总是重启
+    entrypoint:  # 启动命令（内联，无需挂载仓库脚本）
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        : "$${TURN_SECRET}"
+        : "$${PUBLIC_HOST}"
+        set -- \
+          --log-file stdout \
+          --listening-port 3478 \
+          --min-port 40000 \
+          --max-port 40200 \
+          --fingerprint \
+          --use-auth-secret \
+          --static-auth-secret "$$TURN_SECRET" \
+          --realm "$$PUBLIC_HOST" \
+          --no-tls \
+          --no-dtls \
+          --no-cli \
+          --no-multicast-peers \
+          --mobility
+        if [ -n "$${TURN_EXTERNAL_IP:-}" ]; then
+          set -- "$$@" --external-ip "$$TURN_EXTERNAL_IP"
+        fi
+        exec turnserver "$$@"
+    ports:  # 端口映射
+      - "3478:3478/udp"  # 3478 UDP
+      - "3478:3478/tcp"  # 3478 TCP
+      - "40000-40200:40000-40200/udp"  # 中继端口段(适当收窄,避免过多规则)
+    environment:  # 环境变量
+      TURN_SECRET: "${TURN_SECRET:-}"  # TURN 密钥(和 LANSHARE_TURN_SECRET 保持一致)
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}  # 外网 IP
+      PUBLIC_HOST: ${PUBLIC_HOST:-}  # 启用 TURN profile 时必填：公网域名或 IP

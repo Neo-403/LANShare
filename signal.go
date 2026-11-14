@@ -9,7 +9,8 @@ import (
 )
 
 // InMsg 是客户端能发给服务端的**全部**字段。
-// 注意：没有任何聊天内容、文件元数据或文件数据的字段——业务数据不经过服务端。
+// 业务数据正常只走 WebRTC；Bin 仅在无 TURN 的 WS 兜底场景承载 base64 帧，
+// 服务端只做内存透传，不解析内容、不落盘。
 type InMsg struct {
 	T        string          `json:"t"`
 	V        int             `json:"v"`
@@ -22,6 +23,7 @@ type InMsg struct {
 	To       string          `json:"to"`
 	ID       string          `json:"id"`
 	Bin      string          `json:"bin"`
+	Kind     string          `json:"k"`
 	KeySalt  string          `json:"keySalt"`
 	EncKey   string          `json:"encKey"`
 	Data     json.RawMessage `json:"data"`
@@ -49,16 +51,20 @@ func serveWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad websocket handshake", http.StatusBadRequest)
 		return
 	}
+	// 默认不限速：只有显式配置了 LANSHARE_RELAY_RATE_MB 才创建字节配额限流器。
+	// 帧数限制始终保留以防小帧洪泛；1000/s 对 128KB 分片约 128MB/s，不构成吞吐瓶颈。
+	dataLimit := relayDataLimiter(hub.cfg)
 	c := &Client{
-		id:         randHex(6),
-		nick:       randomNick(),
-		ws:         ws,
-		hub:        hub,
-		ip:         clientIP(r, hub.cfg.TrustProxy),
-		send:       make(chan []byte, 512),
-		done:       make(chan struct{}),
-		limit:      newLimiter(100, 200), // 信令 100/s
-		relayLimit: newLimiter(20, 40),   // 兜底 relay 20/s
+		id:             randHex(6),
+		nick:           randomNick(),
+		ws:             ws,
+		hub:            hub,
+		ip:             clientIP(r, hub.cfg.TrustProxy),
+		send:           make(chan []byte, 512),
+		done:           make(chan struct{}),
+		limit:          newLimiter(100, 200),   // 信令 100/s
+		relayLimit:     newLimiter(1000, 2000), // 兜底帧 1000/s（数据中继也用，防止小帧洪泛）
+		relayDataLimit: dataLimit,              // nil = 不限速
 	}
 	hub.add(c)
 	go c.writer()
@@ -74,14 +80,15 @@ func serveWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if op != opText {
-			continue // 不接受二进制帧：业务数据只走 WebRTC / TURN
+			continue // 只接受文本帧：中继数据也以 base64 文本承载；P2P 业务帧走 DataChannel
 		}
 		var m InMsg
 		if json.Unmarshal(payload, &m) != nil {
 			c.sendError("bad_frame", "无法解析的 JSON")
 			continue
 		}
-		if !c.limit.allow(1) {
+		// 数据中继有自己的字节配额限流，不再占用信令的 100/s 次数。
+		if m.T != "relay_data" && !c.limit.allow(1) {
 			c.sendError("rate_limited", "操作过于频繁")
 			continue
 		}
@@ -147,9 +154,10 @@ func (h *Hub) handle(c *Client, m *InMsg) {
 			"ice":    h.cfg.ICEConfig(user, cred),
 			"scope":  map[string]any{"key": c.scope, "kind": kind, "label": label},
 			"limits": map[string]any{
-				"maxMembers": h.cfg.MaxMembers,
-				"maxRooms":   h.cfg.MaxRooms,
-				"relayMax":   64 * 1024,
+				"maxMembers":   h.cfg.MaxMembers,
+				"maxRooms":     h.cfg.MaxRooms,
+				"relayMax":     relayMaxBytes,
+				"relayDataMax": relayDataRawMax,
 			},
 		})
 
@@ -266,6 +274,20 @@ func (h *Hub) handle(c *Client, m *InMsg) {
 			return
 		}
 		if err := h.relayTo(c, m.To, m.Bin); err != nil {
+			c.sendError(errCode(err), err.Error())
+		}
+
+	case "relay_data":
+		if !c.relayLimit.allow(1) {
+			c.sendError("rate_limited", "兜底转发频率过高")
+			return
+		}
+		if c.relayDataLimit != nil &&
+			!c.relayDataLimit.allow(float64(len(m.Bin))/1024) {
+			c.sendError("rate_limited", "中继数据速率超限")
+			return
+		}
+		if err := h.relayDataTo(c, m.To, m.Kind, m.Bin); err != nil {
 			c.sendError(errCode(err), err.Error())
 		}
 

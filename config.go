@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -15,11 +16,12 @@ type Config struct {
 	KeyFile    string
 	ExportCert string // 把内存自签证书导出为 <prefix>.crt/.key，便于手机信任与固定复用
 
-	TurnSecret string
-	TurnURLs   []string
-	StunURLs   []string
-	TurnTTL    int64
-	TrustProxy bool
+	TurnSecret  string
+	TurnURLs    []string
+	StunURLs    []string
+	TurnTTL     int64
+	TrustProxy  bool
+	RelayRateMB float64 // 每连接 WS 数据中继带宽上限（MB/s），0 表示不限速
 
 	MaxRooms   int
 	MaxMembers int
@@ -28,6 +30,15 @@ type Config struct {
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			return f
+		}
 	}
 	return def
 }
@@ -55,11 +66,12 @@ func loadConfig() Config {
 	flag.StringVar(&c.ExportCert, "export-cert", env("LANSHARE_EXPORT_CERT", ""), "导出自签证书的前缀（生成 <prefix>.crt / .key）")
 	flag.StringVar(&c.TurnSecret, "turn-secret", env("LANSHARE_TURN_SECRET", ""), "coturn static-auth-secret")
 	flag.StringVar(&turnURLsRaw, "turn-urls", env("LANSHARE_TURN_URLS", ""), "逗号分隔的 TURN URLs")
-	flag.StringVar(&stunURLsRaw, "stun-urls", env("LANSHARE_STUN_URLS", "stun:stun.l.google.com:19302"), "逗号分隔的 STUN URLs")
+	flag.StringVar(&stunURLsRaw, "stun-urls", env("LANSHARE_STUN_URLS", ""), "逗号分隔的 STUN URLs；留空表示没有可用的外部打洞服务器")
 	flag.BoolVar(&c.TrustProxy, "trust-proxy", env("LANSHARE_TRUST_PROXY", "") == "1", "信任 X-Forwarded-For（仅在有反向代理时开启）")
 	flag.IntVar(&c.MaxRooms, "max-rooms", 200, "房间总数上限")
 	flag.IntVar(&c.MaxMembers, "max-members", 10, "单房间人数上限")
 	flag.Int64Var(&c.TurnTTL, "turn-ttl", 3600, "TURN 临时凭据有效期（秒）")
+	flag.Float64Var(&c.RelayRateMB, "relay-rate", envFloat("LANSHARE_RELAY_RATE_MB", 0), "每连接 WS 数据中继带宽上限（MB/s，0=不限速）")
 	flag.Parse()
 
 	c.TurnURLs = splitURLs(turnURLsRaw)
@@ -86,5 +98,10 @@ func (c Config) ICEConfig(turnUser, turnCred string) map[string]any {
 			"credential": turnCred,
 		})
 	}
-	return map[string]any{"iceServers": servers}
+	// noIceServers 让前端明确知道「本次部署没有任何外部 STUN/TURN」：
+	// 此时跨网不可能打洞，应尽快切到服务器 WS 中继，而不是干等 ICE 超时。
+	return map[string]any{
+		"iceServers":   servers,
+		"noIceServers": len(servers) == 0,
+	}
 }

@@ -87,6 +87,20 @@ export const DIRECT_SEQ_UNIT = 1024;   // nonce 序号按绝对偏移派生，�
 export const DIRECT_HIGH_WATER = 2 * 1024 * 1024;
 export const DIRECT_LOW_WATER = 1 * 1024 * 1024;
 
+// ---- 无 TURN 时的 WS 数据中继 ----
+// 与服务端 relayDataRawMax 一致：单个 base64 帧解码后不得超过 192KB。
+// 文件分片 128KB + 帧头 + AES-GCM tag 仍在范围内；直传块另收窄到 64KB。
+export const RELAY_DATA_MAX = 192 * 1024;
+export const RELAY_DIRECT_BLOCK = 64 * 1024;
+// 直接读 WebSocket.bufferedAmount 做背压。不限速时水位放宽，
+// 避免高速链路下频繁进入等待把连续推流切成脉冲；它只做背压，不限制带宽。
+export const RELAY_HIGH_WATER = 4 * 1024 * 1024;
+export const RELAY_LOW_WATER = 1024 * 1024;
+// 服务端下发 ice.noIceServers=true（未配置任何外部 STUN/TURN）时，跨网不可能打洞。
+// 只给内网 host candidate 直连留一个短窗口，超时即切服务器 WS 中继。
+// 配置了 STUN/TURN 时不启用此定时器，交给 ICE 自行协商，避免抢在 TURN 前面。
+export const NO_ICE_CONNECT_TIMEOUT_MS = 2500;
+
 export class Emitter {
   constructor() { this._m = new Map(); }
   on(k, fn) {

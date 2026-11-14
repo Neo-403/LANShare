@@ -2,8 +2,10 @@ import {
   Emitter, hexToBytes, bytesToHex, PUSH_LOW_WATER, PUSH_HIGH_WATER,
   DIRECT_LOW_WATER, DIRECT_HIGH_WATER, DIRECT_MAX_BLOCK, DIRECT_MIN_BLOCK,
   DIRECT_BLOCK_ALIGN, DIRECT_OVERHEAD, DIRECT_PCS,
+  RELAY_DIRECT_BLOCK, RELAY_HIGH_WATER, RELAY_LOW_WATER,
 } from './util.js';
 import { seal, open, sealChunk, openChunk } from './crypto.js';
+import { relayData } from './net.js';
 
 const MAGIC0 = 0x53; // 'L'
 const MAGIC1 = 0x4C; // 'S'
@@ -93,6 +95,84 @@ export class Mesh extends Emitter {
     this.self = self;
     this.peers = new Map();
     this.key = null;
+    // relayMode 为 true 时，DataChannel 被 WS 中继整体替换。上层 FileMesh /
+    // DirectStream 仍调用同一组 pushData / pushDirect / ready / channelFor，
+    // 因此无 TURN 降级时文件网格、多源分工与直传逻辑都无需改动。
+    this.relayMode = false;
+    this.relayDrainTimer = 0;
+    this.relayPausedUntil = 0; // 服务端反馈的接收端拥塞，暂停到该时刻
+  }
+
+  setRelayMode(on) {
+    const next = !!on;
+    if (this.relayMode === next) return;
+    this.relayMode = next;
+    this.relayPausedUntil = 0;
+    if (!next) {
+      clearInterval(this.relayDrainTimer);
+      this.relayDrainTimer = 0;
+    } else {
+      // 通知文件层重新宣告分片并重新分工，否则传输会停在等 P2P 就绪。
+      for (const id of this.peers.keys()) this.emit('ready', id);
+    }
+  }
+
+  relayBuffered() {
+    const ws = this.net.ws;
+    if (!ws || ws.readyState !== 1) return Infinity;
+    return ws.bufferedAmount || 0;
+  }
+
+  relayChannel() {
+    return { readyState: 'open', bufferedAmount: this.relayBuffered() };
+  }
+
+  // 服务端发现接收端队列拥塞时下发 relay_pause；暂停期间推流返回 false，
+  // 上层泵会走 waitDrain 短等再试，不会丢片也不会把服务器冲垮。
+  pauseRelay(ms) {
+    if (!this.relayMode) return;
+    const n = Number(ms);
+    const delay = Number.isFinite(n) ? Math.max(0, Math.min(1000, n)) : 200;
+    this.relayPausedUntil = Math.max(this.relayPausedUntil, Date.now() + delay);
+    this.notifyRelayDrain();
+  }
+
+  // 发送一整帧（已打包、私有房已加密）。超过水位或处于节流期返回 false，
+  // 由上层等待 drain 后重试。
+  sendRelay(id, kind, frame) {
+    if (!this.peers.has(id)) return false;
+    if (Date.now() < this.relayPausedUntil || this.relayBuffered() > RELAY_HIGH_WATER) {
+      this.notifyRelayDrain();
+      return false;
+    }
+    const ok = relayData(this.net, id, kind, frame);
+    if (ok && this.relayBuffered() > RELAY_HIGH_WATER) this.notifyRelayDrain();
+    return ok;
+  }
+
+  notifyRelayDrain() {
+    if (!this.relayMode || this.relayDrainTimer) return;
+    this.relayDrainTimer = setInterval(() => {
+      if (!this.relayMode) {
+        clearInterval(this.relayDrainTimer);
+        this.relayDrainTimer = 0;
+        return;
+      }
+      if (this.relayBuffered() <= RELAY_LOW_WATER) {
+        clearInterval(this.relayDrainTimer);
+        this.relayDrainTimer = 0;
+        for (const id of this.peers.keys()) this.emit('drain', id);
+      }
+    }, 16);
+  }
+
+  // 接收侧：把经 WS 中继到达的帧喂进与 DataChannel 完全相同的解析/解密路径。
+  relayIngest(from, kind, u8) {
+    if (!this.relayMode || !(u8 instanceof Uint8Array)) return;
+    const p = this.peers.get(from);
+    if (!p) return;
+    this.onBinary(p, kind === 'direct' ? 'direct' : 'data0', u8)
+      .catch(e => console.warn('[rtc] relay', e));
   }
 
   setKey(key) { this.key = key; }
@@ -108,8 +188,12 @@ export class Mesh extends Emitter {
     }));
   }
 
-  ready(id) { return this.peers.get(id)?.ctrl?.readyState === 'open'; }
+  ready(id) {
+    if (this.relayMode) return this.peers.has(id);
+    return this.peers.get(id)?.ctrl?.readyState === 'open';
+  }
   isBackpressured(id) {
+    if (this.relayMode) return this.relayBuffered() > RELAY_HIGH_WATER;
     const chans = (this.peers.get(id)?.data || []).filter(c => c.readyState === 'open');
     if (!chans.length) return true;
     return Math.min(...chans.map(c => c.bufferedAmount)) > BACKPRESSURE;
@@ -117,6 +201,7 @@ export class Mesh extends Emitter {
 
   // 流式推送的底层通道：选缓冲最小的一条，供泵连续 send。
   channelFor(id) {
+    if (this.relayMode) return this.peers.has(id) ? this.relayChannel() : null;
     const chans = (this.peers.get(id)?.data || []).filter(c => c.readyState === 'open');
     if (!chans.length) return null;
     return chans.reduce((a, b) => (a.bufferedAmount <= b.bufferedAmount ? a : b));
@@ -125,6 +210,7 @@ export class Mesh extends Emitter {
   // 帧已由 FileMesh 批量构造（含加密），这里只做水位检查与发送，
   // 不再 parseChunk / sealChunk / 重复打包，省掉每片 128KB 级内存拷贝。
   pushData(id, frame, highWater = BACKPRESSURE) {
+    if (this.relayMode) return this.sendRelay(id, 'data', frame);
     const ch = this.channelFor(id);
     if (!ch || ch.bufferedAmount > highWater) return false;
     try { ch.send(frame); return true; } catch { return false; }
@@ -133,6 +219,7 @@ export class Mesh extends Emitter {
   // 两人直传专用通道组：无序可靠，多流并行推同一字节流。
   // 返回已打开的通道数组（空数组/不存在则视为不可用）。
   directChannelFor(id) {
+    if (this.relayMode) return this.peers.has(id) ? [this.relayChannel()] : null;
     const arr = this.peers.get(id)?.direct;
     if (!arr || !arr.length) return null;
     const open = arr.filter(c => c.readyState === 'open');
@@ -140,6 +227,7 @@ export class Mesh extends Emitter {
   }
 
   pushDirect(id, frame, highWater = DIRECT_HIGH_WATER) {
+    if (this.relayMode) return this.sendRelay(id, 'direct', frame);
     const arr = this.directChannelFor(id);
     if (!arr) return false;
     // 选缓冲最空的通道发送，让多流负载尽量均衡，整体吞吐接近单流上限 × 流数。
@@ -153,7 +241,9 @@ export class Mesh extends Emitter {
   }
 
   // SCTP 协商后的单消息上限：把直传帧尽量做大，减少每字节的协议开销。
+  // WS 中继走文本 JSON，单帧必须收窄到 RELAY_DIRECT_BLOCK。
   maxMessageSize(id) {
+    if (this.relayMode) return RELAY_DIRECT_BLOCK + DIRECT_OVERHEAD;
     const m = this.peers.get(id)?.pcs?.[0]?.sctp?.maxMessageSize;
     return Number.isFinite(m) && m > DIRECT_OVERHEAD ? m : 256 * 1024;
   }
@@ -256,30 +346,34 @@ export class Mesh extends Emitter {
           if (obj) this.emit('ctrl', p.id, obj);
         } catch { /* 密钥不一致或密文损坏，丢弃 */ }
       } else {
-        const u8 = new Uint8Array(ev.data);
-        if (ch.label.startsWith('direct')) {
-          // 直传帧由 DirectStream 解析；私有房的帧加密也在那里处理，
-          // 公开房则完全零拷贝直通。并行通道按 offset 重组，对文件模型透明。
-          this.emit('direct', p.id, u8);
-          return;
-        }
-        const parsed = parseChunk(u8);
-        if (!parsed) return;
-        if (!this.key) {
-          // 公开房跳过应用层加密：直接把收到的帧交给 FileMesh，省一次 128KB 拷贝。
-          this.emit('data', p.id, u8);
-          return;
-        }
-        let plain;
-        try { plain = await openChunk(this.key, parsed.fidBytes, parsed.idx, parsed.payload); }
-        catch { return; }
-        this.emit('data', p.id, packChunk(parsed.fid, parsed.idx, plain));
+        await this.onBinary(p, ch.label, new Uint8Array(ev.data));
       }
     };
     ch.onclose = () => {
       p.ready = false;
       this.emit('peers', this.list());
     };
+  }
+
+  // DataChannel 与 WS 中继共用的二进制帧入口：帧格式、私有房解密口径完全一致。
+  async onBinary(p, label, u8) {
+    if (label.startsWith('direct')) {
+      // 直传帧由 DirectStream 解析；私有房的帧加密也在那里处理，
+      // 公开房则完全零拷贝直通。并行通道按 offset 重组，对文件模型透明。
+      this.emit('direct', p.id, u8);
+      return;
+    }
+    const parsed = parseChunk(u8);
+    if (!parsed) return;
+    if (!this.key) {
+      // 公开房跳过应用层加密：直接把收到的帧交给 FileMesh，省一次 128KB 拷贝。
+      this.emit('data', p.id, u8);
+      return;
+    }
+    let plain;
+    try { plain = await openChunk(this.key, parsed.fidBytes, parsed.idx, parsed.payload); }
+    catch { return; }
+    this.emit('data', p.id, packChunk(parsed.fid, parsed.idx, plain));
   }
 
   async onSignal(from, data) {
@@ -328,20 +422,25 @@ export class Mesh extends Emitter {
     try { p.ctrl.send(JSON.stringify(frame)); return true; } catch { return false; }
   }
 
-  // 二进制分片：私有房时按 (fid, idx) 派生 nonce 做 AES-GCM，接收侧自动还原。
+  // 私有房时按 (fid, idx) 派生 nonce 做 AES-GCM，接收侧自动还原。
+  // P2P 与 WS 中继共用，保证两种链路上的帧格式与加密口径完全一致。
+  async sealDataFrame(bytes) {
+    if (!this.key) return bytes;
+    const parsed = parseChunk(bytes);
+    if (!parsed) return null;
+    const ct = await sealChunk(this.key, parsed.fidBytes, parsed.idx, parsed.payload);
+    return packChunk(parsed.fid, parsed.idx, ct);
+  }
+
   async sendData(id, bytes) {
+    const out = await this.sealDataFrame(bytes);
+    if (!out) return false;
+    if (this.relayMode) return this.sendRelay(id, 'data', out);
     const p = this.peers.get(id);
     const chans = (p?.data || []).filter(c => c.readyState === 'open');
     if (!chans.length) return false;
     const ch = chans.reduce((a, b) => (a.bufferedAmount <= b.bufferedAmount ? a : b));
     if (ch.bufferedAmount > BACKPRESSURE) return false;
-    let out = bytes;
-    if (this.key) {
-      const parsed = parseChunk(bytes);
-      if (!parsed) return false;
-      const ct = await sealChunk(this.key, parsed.fidBytes, parsed.idx, parsed.payload);
-      out = packChunk(parsed.fid, parsed.idx, ct);
-    }
     // ch.send() 本身就按调用顺序同步入队，无需再串一层 Promise 链；
     // 去掉这一层 await 后每片少一次微任务，高并发时差别明显。
     try { ch.send(out); return true; } catch { return false; }
@@ -357,6 +456,9 @@ export class Mesh extends Emitter {
   }
 
   closeAll() {
+    clearInterval(this.relayDrainTimer);
+    this.relayDrainTimer = 0;
+    this.relayMode = false;
     for (const id of [...this.peers.keys()]) this.removePeer(id);
   }
 }

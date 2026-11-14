@@ -254,7 +254,7 @@ export class UI extends Emitter {
 
   renderPeers(list, host, isHost = false) {
     this.el.peerCount.textContent = list.length;
-    const label = { LAN: '内网', P2P: '打洞', TURN: '转发', SELF: '我' };
+    const label = { LAN: '内网', P2P: '打洞', TURN: '转发', RELAY: '中继', SELF: '我' };
     this.el.peerList.innerHTML = list.map(m => `
       <div class="peer">
         <span class="dot ${m.ready ? '' : 'wait'}"></span>

@@ -14,7 +14,7 @@ let nick = localStorage.getItem('lanshare.nick') || '';
 let netId = localStorage.getItem('lanshare.netId') || '';
 let lan = '';
 let lanReady = null;
-let ice = { iceServers: [] };
+let ice = { iceServers: [], noIceServers: true };
 let scope = { kind: 'approx', label: '推测同网' };
 let mesh = null;
 let room = null;
@@ -189,7 +189,7 @@ function wireRoom() {
   room.on('system', text => ui.addSystem(text));
   room.on('ctrl', (from, obj) => files.handleCtrl(from, obj).catch(e => console.warn('[file]', e)));
   room.on('wsonly', on => ui.toast(on
-    ? 'P2P 与 TURN 均不可用，已切换到服务器兜底转发（仅文本可用）'
+    ? '打洞失败，已切换到服务器中继（聊天与文件可用，速度受服务器带宽限制）'
     : '已恢复 P2P 连接'));
   files.on('update', t => ui.updateTransfer(t));
   files.on('activity', on => setTransferActive(on));

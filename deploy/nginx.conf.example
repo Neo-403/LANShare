@@ -1,7 +1,9 @@
 # LANShare · Nginx 反代示例（证书完全由 Nginx 提供，后端跑纯 HTTP）
 # 复制为实际站点配置，把 share.example.com 与证书路径换成自己的。
-# 后端固定是 127.0.0.1:8080：Docker 见 .env 的 HTTP_PORT；裸机见 README 第 5 节
-# 的 ./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy。
+# 后端固定是 8080：Docker compose 默认映射 "8080:8080"（见 docker-compose.yml），
+# 裸机见 README 第 5 节的 ./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy。
+# 生产环境建议把 compose 的端口映射改成 127.0.0.1:8080:8080 或用防火墙限制，
+# 避免外部绕过 Nginx 直连后端（后端开启了 -trust-proxy，直连可伪造 XFF）。
 #
 # 群晖 DSM 7 裸机部署要点（完整流程见 README 第 5 节）：
 #   - 本文件放 /etc/nginx/sites-enabled/lanshare.conf。该目录 include 任意 *.conf，
@@ -40,7 +42,9 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/share.example.com/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    # 业务数据只走 WebRTC / TURN，服务端不接收文件上传；限制请求体防滥用。
+    # 业务数据走 WebRTC DataChannel；默认无外部 STUN/TURN 时也会经本 WS 连接
+    # 由服务端内存中继（不解析、不落盘）。服务端不接收 HTTP 文件上传，
+    # 限制请求体只用于防滥用；WS 升级后是 TCP 流，不受该限制影响。
     client_max_body_size 1m;
 
     location / {

@@ -1,5 +1,6 @@
 #!/bin/sh
-# LANShare · coturn 容器入口
+# LANShare · coturn 入口（遗留脚本，供裸机部署参考）
+# 注意：docker-compose.yml 已把同样的逻辑内联到 entrypoint，不再挂载本文件。
 # 密钥只从环境变量读取，不写进配置文件、镜像或 compose 命令行。
 # 注意：本文件必须保持 LF 换行（见 .gitattributes），否则 /bin/sh 会报 \r 错误。
 set -eu

@@ -1,6 +1,6 @@
 # LANShare
 
-浏览器打开即用的局域网 / 跨网络分享工具：房间制、文本与文件、内网直连优先、外网打洞、TURN 兜底。两人时走连续流直传，多人时启用多源 P2P 分片；支持断点续传与息屏保护，服务器不保存聊天记录与文件。
+浏览器打开即用的局域网 / 跨网络分享工具：房间制、文本与文件、内网直连优先、外网打洞、TURN 或服务器 WS 中继兜底。**不部署 coturn 也能跨网使用**——打洞失败时由 LANShare 自身经 WebSocket 中转聊天与文件，只需 443 端口。两人时走连续流直传，多人时启用多源 P2P 分片；支持断点续传与息屏保护，服务器不保存聊天记录与文件。
 
 完整设计与协议见 [`docs/开发文档.md`](docs/开发文档.md)。
 
@@ -140,34 +140,83 @@ git push origin v1.2.3  # 精确推送这一个标签
 
 ### 3. 生产部署（Docker + Nginx，推荐）
 
-**这是证书由 Nginx 提供时的标准形态**：容器内 `lanshare` 跑纯 HTTP，TLS 在 Nginx 终止，coturn 随 compose 一起启动。
+**证书由 Nginx 提供**：容器内 `lanshare` 跑纯 HTTP，TLS 在 Nginx 终止。**默认只启动 `lanshare` 一个容器**，不依赖 coturn，也不需要开放任何 UDP 端口；coturn 是按需开启的可选 profile。
 
 ```bash
 cp .env.example .env          # PowerShell: Copy-Item .env.example .env
-# 编辑 .env：PUBLIC_HOST=你的域名、TURN_SECRET=随机密钥、TURN_EXTERNAL_IP（NAT 后必填）
-openssl rand -hex 24          # 生成 TURN_SECRET
-
-docker compose up -d --build         # 若提示 unknown command，改用 docker-compose up -d --build
-curl http://127.0.0.1:8080/health     # {"ok":true,"rooms":0,"peers":0}
+# 编辑 .env：HTTP_PORT=反代后端端口（默认 8080）；PUBLIC_HOST 仅启用可选 coturn 时才需要
+docker compose up -d          # 使用已发布镜像，无需源码、无需 --build
+curl http://127.0.0.1:8080/health   # {"ok":true,"rooms":0,"peers":0}
 ```
 
-> 若拉取镜像超时请配置镜像加速；若 `golang:1.27-alpine` 或 `coturn/coturn:4.6.2` 标签不可用，可分别改成 `golang:alpine`、`coturn/coturn:latest`（版本锁定会变弱）。校验 compose 配置无需拉取镜像：本机用的是独立 CLI `docker-compose --env-file .env.example config --quiet`。
+> `docker-compose.yml` 已把 coturn 入口脚本内联，所以**只需 `docker-compose.yml` + `.env` 两个文件**即可部署，不必拉取仓库。校验 compose 配置无需拉取镜像：`docker compose --env-file .env.example config --quiet`。若镜像拉取超时请配置镜像加速。
 
-然后把 `deploy/nginx.conf.example` 复制到 Nginx 站点配置，替换域名与证书路径，`nginx -t && nginx -s reload`。浏览器访问 `https://<PUBLIC_HOST>`。
+Nginx 站点配置可参考 `deploy/nginx.conf.example`（独立参考文件，不是运行依赖）：替换域名与证书路径后 `nginx -t && nginx -s reload`。浏览器访问 `https://<PUBLIC_HOST>`。反代只需正常支持 WebSocket 升级（`Upgrade` / `Connection`），**不需要转发 UDP**，也不需要为中继调整 `client_max_body_size`（WS 升级后是 TCP 流，不受 HTTP body 限制）。
 
-compose 内置两个服务：
+| 服务 | 作用 | 端口 | 默认 |
+|---|---|---|---|
+| `lanshare` | 页面 + WS 信令 + 无 TURN 时的 WS 中继 | `8080 tcp`（由 Nginx 反代） | 启动 |
+| `coturn` | 可选：标准 STUN/TURN 中继 | `3478 udp/tcp`、`40000-40200 udp` | 不启动（`profiles: turn`） |
 
-| 服务 | 作用 | 端口 |
+默认模式防火墙只需放行 `443 tcp`。若确需标准 TURN（对称 NAT 下追求更高吞吐）：
+
+```bash
+openssl rand -hex 24          # 生成 TURN_SECRET
+# .env 中填 TURN_SECRET、TURN_URLS、TURN_EXTERNAL_IP（NAT 后必填），然后：
+docker compose --profile turn up -d
+# 再放行 3478 udp+tcp 与 40000-40200 udp
+```
+
+#### 3.1 两种部署模式与服务器中继
+
+服务端在 `welcome` / `joined` 的 `ice` 里同时下发 `iceServers` 与 `noIceServers`，前端据此决定链路，**不再靠运行时猜测**。`noIceServers=true` 的准确条件是「最终没有下发任何 STUN/TURN」——除了两个变量都留空，配了 `TURN_URLS` 却没配 `TURN_SECRET` 导致 TURN 无法下发时也一样。
+
+| 配置 | `iceServers` | 行为 |
 |---|---|---|
-| `lanshare` | 页面 + WS 信令（HTTP） | `127.0.0.1:8080`，仅本机可达 |
-| `coturn` | STUN 打洞 + TURN 中继 | `3478 udp/tcp`、`40000-40200 udp` |
+| `LANSHARE_STUN_URLS` 和 `LANSHARE_TURN_URLS` **都留空**（默认） | 空 | 内网仍走 `host` 直连；跨网无法打洞，给内网直连留 2.5s 窗口后直接切服务器 WS 完整中继 |
+| 配了 STUN / TURN（任一或两者） | 按配置下发 | 正常走 ICE 协商；只有 ICE 明确失败才落 WS 兜底 |
 
-防火墙 / 安全组需放行：`443 tcp`（Nginx）、`3478 udp+tcp`、`40000-40200 udp`。
+两种模式共同的链路优先级：
+
+```text
+host（内网直连） → srflx（STUN 打洞） → relay（外部 TURN） → WS 完整中继
+```
+
+默认模式专门用于**没有可用外网 STUN/TURN 的环境**（纯内网、公共 STUN 不可达），也是「不部署 coturn」的兜底：只要 443 能通，聊天和文件都能传。想跨网打洞就在 `.env` 里填 `STUN_URLS`；想要标准 TURN 再填 `TURN_URLS` + `TURN_SECRET` 并启用 `--profile turn`。
+
+配置了 STUN/TURN 时**不启用抢跑定时器**，完全交给 ICE，避免 TURN 还没建好就被切到慢链路；只有所有 PeerConnection 进入 `failed` / `disconnected` / `closed` 才落 WS 兜底。P2P 恢复后自动切回。UI 会把该链路标为「中继」，并提示速度受服务器带宽限制。
+
+三类帧都只在服务端内存透传 / 处理，不解析业务内容、不落盘：
+
+| 帧 | 方向 | 承载 | 限制 |
+|---|---|---|---|
+| `relay` | C→S→C | 聊天、历史、文件控制帧（base64 JSON） | ≤64KB/帧 |
+| `relay_data` | C→S→C | 文件分片 128KB、两人直传整帧（`k=data\|direct`，base64） | base64 文本 ≤256KB / 解码后 ≤192KB |
+| `relay_pause` | S→C | 接收端队列拥塞时通知发送方暂停 `ms` 毫秒 | 尽力而为，满队列时可丢弃 |
+
+`relay` 与 `relay_data` 共用 **1000 帧/s**（突发 2000）的次数限制，仅用于防小帧洪泛。中继带宽**默认不设上限**，尽可能跑满实际链路；需要限速时用 `-relay-rate` / `LANSHARE_RELAY_RATE_MB`（单位 MB/s，按单个 WS 连接计），compose 里对应 `.env` 的 `RELAY_RATE_MB`，默认 `0` 即不限速。例如 `RELAY_RATE_MB=20` 把每连接限制在 20MB/s，内部令牌桶 `rate=20MB/s`、`burst=2×rate`。单帧大小与 `k` 白名单仍作为协议/防滥用硬限制保留。
+
+前端 `Mesh` 在中继模式下用 WebSocket 整体替换 DataChannel，因此文件网格、多源分工、直传与断点续传逻辑都不变；私有房的文件帧仍是 AES-GCM 密文，服务端看不到内容。
+
+注意：
+
+- 所有数据都走服务器现有的 443 连接，上下行都占用服务器带宽；服务端默认不限速，但速度仍取决于实际链路，通常慢于 P2P。
+- 私有房的 `key_req` / `key_sync` 明文握手帧在极端降级时会经过服务端内存（不落盘）；正常 P2P 链路下服务端只见密文。自建服务器时这是可接受的取舍。
+- 若把 `STUN_URLS` 指向了 coturn 的 `3478`，停用 coturn 时要改成其它 STUN，或干脆留空直接走服务器中继；否则浏览器会一直等一个不存在的打洞服务器。
+- `docker-compose.yml` 目前把后端端口硬编码为 `"8080:8080"`（监听所有网卡），`HTTP_PORT` 只用于说明 Nginx 的反代目标。生产环境建议改成 `"127.0.0.1:8080:8080"` 或用防火墙限制：后端开启了 `LANSHARE_TRUST_PROXY=1`，外部若绕过 Nginx 直连 8080 可伪造 `X-Forwarded-For`。
 
 ### 4. 裸机部署（不用 Docker）
 
+**默认只需要一个进程**：不配置任何 STUN/TURN 时，内网仍走 `host` 直连，跨网直接由服务器 WS 完整中继，不需要外部打洞服务器：
+
 ```bash
-# 进程 1：改好 deploy/turnserver.conf 里的 static-auth-secret 与 external-ip
+./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy
+```
+
+可选：另起 coturn 做标准 TURN（`deploy/turnserver.conf` 改好 `static-auth-secret` 与 `external-ip`），并把同一个密钥与 TURN URL 传给 `lanshare`：
+
+```bash
+# 进程 1（可选）
 turnserver -c deploy/turnserver.conf
 
 # 进程 2：Nginx 反代场景（对外 HTTPS 由 Nginx 提供）
@@ -226,7 +275,7 @@ sleep 1
 nohup ./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy >> lanshare.log 2>&1 &
 ```
 
-跨网络（不同局域网）才需要 coturn 与临时凭据；同局域网可跳过：
+跨网络（不同局域网）**不配 STUN/TURN 时直接由服务器 WS 中继聊天与文件**，配了 `LANSHARE_STUN_URLS` 则走 STUN 打洞，两者都不需要 coturn。只有想要标准 TURN 中继时才额外配置：
 
 ```sh
 LANSHARE_TURN_SECRET='与 coturn 相同的密钥' \
@@ -295,7 +344,8 @@ server {
     ssl_certificate_key /usr/syno/etc/certificate/_archive/<ID>/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    # 业务数据只走 WebRTC / TURN，服务端不接收文件上传
+    # 业务数据走 WebRTC DataChannel，或默认无外部 ICE 时经本 WS 连接由服务端内存中继；
+    # 服务端不接收 HTTP 文件上传、不落盘；WS 升级后不受 client_max_body_size 影响。
     client_max_body_size 1m;
 
     location / {
@@ -356,7 +406,7 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 
 1. 浏览器打开 `https://share.example.com`，首页正常、无证书告警；手机也走这个域名（WebRTC 需要 HTTPS，不要用 `http://NAS的IP:8080`）。
 2. 开发者工具 → Network → WS：`/ws` 返回 `101 Switching Protocols`，连接保持。
-3. 两台同网设备进同一房间互发文本 / 文件；跨网场景再用 4G 设备验证一次（需要 coturn）。
+3. 两台同网设备进同一房间互发文本 / 文件；跨网场景再用 4G 设备验证一次（默认不配 STUN/TURN，应自动切「中继」且文件仍可传；填了 `STUN_URLS` 则验证打洞链路）。
 4. `lanshare.log` 里不应出现 `ws upgrade rejected ... origin not allowed` 或「必须加 -trust-proxy」警告。
 
 完整通用示例见 [`deploy/nginx.conf.example`](deploy/nginx.conf.example)；群晖适配要点见该文件顶部注释。
@@ -368,7 +418,7 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 | 项目 | 谁负责 | 说明 |
 |---|---|---|
 | HTTPS 证书 / 私钥 | **Nginx** | 生产环境不进容器；`LANSHARE_NO_TLS=1` |
-| `TURN_SECRET` | `.env` → 同时注入两个容器 | 唯一需要保密的值，`lanshare` 用它签发 1 小时临时凭据，coturn 用它校验；前端只见临时凭据，永远看不到主密钥 |
+| `TURN_SECRET`（可选） | `.env` → 启用 `--profile turn` 时注入两个容器 | 只在启用标准 TURN 时需要；`lanshare` 用它签发 1 小时临时凭据，coturn 用它校验；前端只见临时凭据，永远看不到主密钥。默认无 coturn 部署留空即可 |
 | 房间密码 | 用户 | 只做 `PBKDF2(password+salt)` 内存准入校验；内容加密用独立的随机会话密钥，密码仅用来「包装」该密钥，服务端两者都拿不到 |
 | 自签证书 | `-export-cert` | **仅局域网试用**，生产不用 |
 
@@ -393,12 +443,13 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 | `-no-tls` | `LANSHARE_NO_TLS=1` | 关 | 关闭 TLS（Nginx 反代提供 HTTPS，或 localhost 开发） |
 | `-cert` / `-key` | `LANSHARE_CERT` / `LANSHARE_KEY` | 空 | 正式证书；为空则自动生成内存自签证书 |
 | `-export-cert` | `LANSHARE_EXPORT_CERT` | 空 | 导出自签证书前缀，生成 `<前缀>.crt/.key` |
-| `-turn-secret` | `LANSHARE_TURN_SECRET` | 空 | coturn `static-auth-secret`，为空则不下发 TURN |
-| `-turn-urls` | `LANSHARE_TURN_URLS` | 空 | 逗号分隔的 TURN URL；**为空时不下发 TURN**，只走 STUN 打洞 |
-| `-stun-urls` | `LANSHARE_STUN_URLS` | 公共 Google STUN | 逗号分隔；compose 中同时加入自建 coturn 的 STUN |
+| `-turn-secret` | `LANSHARE_TURN_SECRET` | 空 | 可选 coturn 的 `static-auth-secret`；为空则不下发 TURN（无 coturn 部署保持为空） |
+| `-turn-urls` | `LANSHARE_TURN_URLS` | 空 | 逗号分隔的 TURN URL；为空时不下发 TURN |
+| `-stun-urls` | `LANSHARE_STUN_URLS` | **空** | 逗号分隔的 STUN URL；**与 `-turn-urls` 都为空时服务端下发 `noIceServers=true`，前端直接走服务器 WS 中继**（内网仍优先 host 直连） |
 | `-trust-proxy` | `LANSHARE_TRUST_PROXY=1` | 关 | **仅在有可信反代时开启** |
 | `-max-rooms` / `-max-members` | — | 200 / 10 | 房间数 / 单房人数 |
 | `-turn-ttl` | — | 3600 | TURN 临时凭据有效期（秒） |
+| `-relay-rate` | `LANSHARE_RELAY_RATE_MB` | `0` | 每连接 WS 数据中继带宽上限（MB/s）；**0 = 不限速**，compose 用 `.env` 的 `RELAY_RATE_MB` |
 
 ---
 
@@ -423,7 +474,7 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 2. 首页只有**一个入口**：输入 6 位房间号，已存在就直接加入、不存在就按该号码新建；留空则随机新建。密码留空 = 公开，填密码 = 私有。私有房内容端到端加密；公开房跳过应用层二次加密、由 WebRTC 的 DTLS 保护链路，以换取更高吞吐。会话密钥由创建者随机生成、全生命周期不变。
 3. 跨网络的朋友用房间页「分享链接」按钮：手机扫二维码或复制 `…#rid=XXXXXX&pwd=…` 链接即可自动加入（房间号与密码放在 fragment，不经过服务端）。跨网房间不会出现在任何人的列表里。
 4. 文件发送后只广播一张卡片，**接收方点「接收」才开始传输**。按房间人数自动选传输模式：
-   - **两人 = 直连快传**：不切片、不做分片位图/多源分工，一次订阅后把文件当连续字节流推完；按 SCTP 单消息上限（最大 1MB）分帧、每 4MB 落一次盘，用无序可靠通道 + 8MB 水位 + 双缓冲预读跑满单连接。
+   - **两人 = 直连快传**：不切片、不做分片位图/多源分工，一次订阅后把文件当连续字节流推完；按 SCTP 单消息上限（最大 1MB）分帧、每 4MB 落一次盘，用无序可靠通道 + 2MB 水位（三人及以上分片模式为 8MB）+ 双缓冲预读跑满单连接。
    - **三人及以上 = P2P 分片**：128KB 分片、最多 4 源取模分工并行取片，下载完成者自动成为新的供种源，支持边下边传。
    
    两种模式都是流式推送（无逐片往返），卡片显示实时/峰值速率、模式、源数与已续传量。可用同网 HTTP 大文件下载作为链路基线对照。
@@ -438,15 +489,16 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 | 组件 | 端口 |
 |---|---|
 | Nginx | 443 tcp（对外 HTTPS/WSS） |
-| `lanshare` | 8080 tcp（反代后端）/ 8443 tcp（自签直连） |
-| `coturn` | 3478 udp+tcp |
-| `coturn` 中继 | 裸机 49152–65535 udp / Docker 40000–40200 udp |
+| `lanshare` | 8080 tcp（反代后端；compose 默认映射 `"8080:8080"`，生产建议限制为回环）/ 8443 tcp（自签直连） |
+| WS 完整中继 | **复用上面的 443 tcp，无新增端口** |
+| `coturn`（可选） | 3478 udp+tcp |
+| `coturn` 中继（可选） | 裸机 49152–65535 udp / Docker 40000–40200 udp |
 
 ## 验证
 
 ```bash
 go build ./... && go vet ./...
-docker-compose --env-file .env.example config --quiet   # 或用 docker compose config --quiet
+docker compose --env-file .env.example config --quiet   # 校验配置，无需拉取镜像
 
 # 交叉编译产物（群晖 x86_64）；以下 grep 命令在 Linux / macOS / WSL 执行，
 # PowerShell 用 go version -m lanshare | Select-String 'GOOS|GOARCH|CGO_ENABLED'
@@ -457,15 +509,15 @@ grep -a -c 'chat_part' lanshare    # >0 说明最新前端已 go:embed 进去
 curl https://<host>/health       # {"ok":true,"rooms":0,"peers":0}
 ```
 
-真机验证建议按 `docs/开发文档.md` 第 11 节的 P1–P5 清单逐项做；跨网场景务必再验证一次 4G 设备经 TURN 加入。
+真机验证建议按 `docs/开发文档.md` 第 11 节的 P1–P5 清单逐项做；跨网场景分别验证「默认 STUN/TURN 留空，4G 设备自动走服务器中继并传完一个文件」「填 `STUN_URLS` 后经打洞直连」「启用 `--profile turn` 后走标准 TURN 中继」三条路径。
 
 ## 已知限制
 
 - 浏览器无法 UDP 广播 / 获取 SSID，"同 LAN 自动发现"只能是推测；绑定网络标识可消除误判。
 - 历史只存在于在线设备内存，最后一人离线即消失；历史文件只有卡片元数据，本体需在线设备仍持有。接收端已下载的分片/段存在本机 IndexedDB，可断点续传；分享端的 `File` 对象无法跨页面恢复。
-- 对称 NAT 且 TURN 不可用时只剩 WS 兜底，仅保证文本可用。
+- 对称 NAT 且无 TURN 时会切到服务器 WS 中继，聊天与文件都可用；服务端默认不限速，但上下行都吃服务器带宽，速度仍取决于实际链路，通常慢于 P2P。接收端拥塞时服务端会下发 `relay_pause` 让发送方短暂降速，缺片由文件层重传补齐。
 - Wake Lock 需要 HTTPS/localhost 且浏览器支持；系统仍可能挂起后台页面，此时靠进度落盘 + 自动重进房续传。iOS Safari 后台标签页会限流 WebRTC。
 - 1200M/2400M 是 WiFi 协商速率，不是实际吞吐；两台无线终端经同一 AP 互传要占两次空口，单条 SCTP 流也受拥塞窗口限制，无法保证打满物理带宽。
-- Docker Desktop（Windows/macOS）若要改用 `network_mode: host`，需先开启 host networking；默认端口范围映射无需该特性。
+- Docker Desktop（Windows/macOS）若要改用 `network_mode: host`，需先开启 host networking；只有启用 `turn` profile 时的 UDP 端口范围映射才用得上该特性，默认部署不涉及。
 
 详见开发文档第 9、10 节。
