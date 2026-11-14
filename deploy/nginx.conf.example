@@ -1,0 +1,55 @@
+# LANShare · Nginx 反代示例（证书完全由 Nginx 提供，后端跑纯 HTTP）
+# 复制为实际站点配置，把 share.example.com 与证书路径换成自己的。
+# 后端：docker compose 映射的 127.0.0.1:8080（见 .env 的 HTTP_PORT）。
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name share.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # 需要 HTTP/2 时：Nginx >= 1.25.1 加 "http2 on;"；旧版改为 "listen 443 ssl http2;"
+    server_name share.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/share.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/share.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # 业务数据只走 WebRTC / TURN，服务端不接收文件上传；限制请求体防滥用。
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        # 关键：Host 必须与浏览器 Origin 的域名一致，否则 WS upgrade 的 Origin 校验会拒绝。
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 关键：用 $remote_addr 覆盖（而非 $proxy_add_x_forwarded_for 追加），
+        # 防止客户端伪造 XFF 骗取「同局域网」分组。trust-proxy 依赖这个值。
+        proxy_set_header X-Forwarded-For  $remote_addr;
+
+        # WebSocket（/ws）必须
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:8080/health;
+        access_log off;
+    }
+}

@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<title>LANShare · 局域网分享</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand"><span class="logo">LS</span><span>LANShare</span></div>
+    <button id="scopeBtn" class="chip" title="点击绑定网络标识">检测网络中…</button>
+    <span id="connState" class="conn">连接中…</span>
+  </header>
+
+  <main id="home" class="view">
+    <div class="home-grid">
+      <section class="panel panel-rooms">
+        <div class="panel-head">
+          <h2>同网络房间</h2>
+          <button id="refreshRooms" class="btn btn-ghost btn-sm">刷新</button>
+        </div>
+        <p id="scopeNote" class="hint"></p>
+        <div id="roomList" class="room-list"></div>
+      </section>
+
+      <div class="home-side">
+        <section class="panel">
+          <h2>进入 / 创建房间</h2>
+          <p class="hint">输入房间号：已存在就直接加入，不存在就按该号码新建；留空则随机新建。</p>
+          <form id="enterForm" class="form">
+            <input id="nickInput" maxlength="24" placeholder="我的昵称" autocomplete="nickname">
+            <input id="enterRid" maxlength="6" placeholder="6 位房间号（留空随机新建）" autocapitalize="characters" spellcheck="false">
+            <input id="roomName" maxlength="32" placeholder="房间名称（可选，新建时生效）">
+            <input id="enterPwd" type="password" maxlength="128" placeholder="房间密码（可选）">
+            <button type="submit" class="btn btn-primary">进入 / 创建房间</button>
+          </form>
+          <p class="hint">密码留空即公开房间；也可以直接打开别人分享的链接自动加入。</p>
+        </section>
+
+        <section class="panel panel-tip">
+          <h3>传输说明</h3>
+          <p class="hint">同网直连不经过服务器；跨网优先打洞，失败才由服务器转发。服务器不保存聊天记录与文件。</p>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <main id="chat" class="view hidden">
+    <div class="room-head">
+      <div class="room-title">
+        <h2 id="roomTitle"></h2>
+        <span id="roomCode" class="code"></span>
+        <span id="roomBadge" class="badge"></span>
+      </div>
+      <div class="room-actions">
+        <button id="nickBtn" class="btn btn-sm" title="点击修改昵称">我：…</button>
+        <button id="roomSettingsBtn" class="btn btn-sm hidden">房间密码</button>
+        <button id="copyCode" class="btn btn-sm">复制房间号</button>
+        <button id="shareBtn" class="btn btn-sm btn-primary">分享链接</button>
+        <button id="closeRoomBtn" class="btn btn-sm btn-danger hidden">解散</button>
+        <button id="leaveBtn" class="btn btn-sm">离开</button>
+      </div>
+    </div>
+
+    <div class="room-body">
+      <aside class="peers">
+        <div class="peers-head">在线成员 <span id="peerCount">0</span></div>
+        <div id="peerList"></div>
+      </aside>
+      <div class="stream">
+        <div id="messages" class="messages"></div>
+        <div id="transfers" class="transfers"></div>
+      </div>
+    </div>
+
+    <div class="composer">
+      <input id="fileInput" type="file" multiple hidden>
+      <!-- maxLength 由 ui.js 按 MAX_TEXT_CHARS 设置，保持单一真源 -->
+      <div id="composerInput" class="composer-input">
+        <textarea id="textInput" rows="5" placeholder="输入文本，Enter 发送 / Shift+Enter 换行"></textarea>
+        <span id="textHint" class="text-hint hidden" aria-live="polite"></span>
+      </div>
+      <div class="composer-actions">
+        <button id="pickFile" class="btn" title="发送文件">文件</button>
+        <button id="sendText" class="btn btn-primary">发送</button>
+      </div>
+    </div>
+  </main>
+
+  <div class="app-foot">
+    <div class="room-foot-left">
+      <label><input type="checkbox" id="seedOnCellular"> 允许移动流量供种</label>
+      <span id="linkInfo" class="hint"></span>
+      <span id="wakeState" class="hint"></span>
+    </div>
+    <footer class="copyright">
+      Copyright ©2026 <a href="http://github.com/Neo-403/LANShare" target="_blank" rel="noopener noreferrer">造物者W</a>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-box">
+      <h2>网络标识</h2>
+      <p class="hint">同一局域网的设备填写<b>相同</b>的标识，即可精确归组，避免「推测同网」误判。标识仅保存在本机浏览器。</p>
+      <input id="netIdInput" maxlength="32" placeholder="例如：office-3f / home-wifi">
+      <div class="modal-actions">
+        <button id="netIdRandom" class="btn btn-sm">随机生成</button>
+        <button id="netIdCopy" class="btn btn-sm">复制</button>
+      </div>
+      <div class="modal-actions">
+        <button id="netIdClear" class="btn btn-sm">清除（回到推测模式）</button>
+        <button id="netIdSave" class="btn btn-sm btn-primary">保存</button>
+        <button id="netIdCancel" class="btn btn-sm">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="nickModal" class="modal hidden">
+  <div class="modal-box">
+    <h2>修改昵称</h2>
+    <p class="hint">房间内昵称由服务端保证唯一；若与他人重名会自动追加序号。昵称用于区分谁发的内容。</p>
+    <input id="nickModalInput" maxlength="24" placeholder="新昵称">
+    <div class="modal-actions">
+      <button id="nickModalCancel" class="btn btn-sm">取消</button>
+      <button id="nickModalSave" class="btn btn-sm btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="pwdModal" class="modal hidden">
+  <div class="modal-box">
+    <h2>房间密码</h2>
+    <p id="pwdState" class="hint"></p>
+    <p class="hint">修改只影响之后加入的人：当前已连接成员不会被移出、无需重新输入密码，聊天不中断。</p>
+    <input id="newPwd" type="password" maxlength="128" placeholder="新密码（留空 = 公开房间）" autocomplete="new-password">
+    <input id="newPwd2" type="password" maxlength="128" placeholder="再输入一次新密码" autocomplete="new-password">
+    <div class="modal-actions">
+      <button id="pwdRemove" class="btn btn-sm btn-danger hidden">移除密码</button>
+      <button id="pwdCancel" class="btn btn-sm">取消</button>
+      <button id="pwdSave" class="btn btn-sm btn-primary">保存密码</button>
+    </div>
+  </div>
+</div>
+
+<div id="shareModal" class="modal hidden">
+  <div class="modal-box">
+    <h2>分享房间链接</h2>
+    <p class="hint">手机扫码，或点下方链接复制。链接已包含房间号与密码，打开即自动加入。</p>
+    <div class="qr-wrap"><canvas id="shareQr" aria-label="房间链接二维码"></canvas></div>
+    <button id="shareLink" class="share-link" type="button" title="点击复制链接"></button>
+    <div class="modal-actions">
+      <button id="shareCopy" class="btn btn-sm btn-primary">复制链接</button>
+      <button id="shareClose" class="btn btn-sm">关闭</button>
+    </div>
+  </div>
+</div>
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

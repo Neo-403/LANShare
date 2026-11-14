@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+*.md
+docs/
+deploy/
+lanshare
+lanshare.exe
+*.out
+*.err
+smoke.*

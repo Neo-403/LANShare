@@ -1,0 +1,49 @@
+name: lanshare
+
+services:
+  # 页面 + WS 信令。TLS 由宿主机 Nginx 终止，容器内只跑 HTTP。
+  lanshare:
+    build: .
+    image: lanshare:local
+    restart: unless-stopped
+    environment:
+      LANSHARE_ADDR: ":8080"
+      LANSHARE_NO_TLS: "1"
+      LANSHARE_TRUST_PROXY: "1"
+      LANSHARE_TURN_SECRET: ${TURN_SECRET:?请在 .env 中设置 TURN_SECRET}
+      LANSHARE_TURN_URLS: "turn:${PUBLIC_HOST:?请在 .env 中设置 PUBLIC_HOST}:3478?transport=udp,turn:${PUBLIC_HOST}:3478?transport=tcp"
+      LANSHARE_STUN_URLS: "stun:${PUBLIC_HOST}:3478,stun:stun.l.google.com:19302"
+    ports:
+      # 只绑定到本机回环，外部流量一律经 Nginx（HTTPS）
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
+    depends_on:
+      - coturn
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # 打洞服务（Q3）：STUN + TURN，凭据由 lanshare 用同一个 TURN_SECRET 临时签发。
+  coturn:
+    image: coturn/coturn:4.6.2
+    restart: unless-stopped
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      # 中继端口段收窄到 201 个，避免 Docker 生成上万条 iptables 规则；
+      # 10 人房间足够。裸机部署可改回 deploy/turnserver.conf 里的更大范围。
+      - "40000-40200:40000-40200/udp"
+    environment:
+      TURN_SECRET: ${TURN_SECRET:?请在 .env 中设置 TURN_SECRET}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      PUBLIC_HOST: ${PUBLIC_HOST:?请在 .env 中设置 PUBLIC_HOST}
+    # 用独立脚本而非内联 shell：避免 compose 的 $$ 转义与 shellwords 拆分踩坑。
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    volumes:
+      - ./deploy/coturn-entrypoint.sh:/entrypoint.sh:ro
+    # Linux 上若不想映射 201 个 UDP 端口，可改为 network_mode: host（删掉上面 ports）。
+    # Windows / macOS 的 Docker Desktop 需开启 host networking 才能用该模式。
+
+# 若 Nginx 也要容器化，可自行加一个 service 挂载 deploy/nginx.conf.example 与证书目录；
+# 本 compose 默认对接宿主机 Nginx，证书完全由用户掌控。

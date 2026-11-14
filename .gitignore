@@ -1,0 +1,9 @@
+/lanshare
+/lanshare.exe
+*.exe~
+*.out
+*.err
+/smoke.*
+/.env
+/deploy/cert/*.crt
+/deploy/cert/*.key
