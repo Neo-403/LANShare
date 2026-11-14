@@ -227,6 +227,109 @@ LANSHARE_TURN_URLS='turn:share.example.com:3478?transport=udp,turn:share.example
 
 若不用反代、直接由程序持有正式证书：`./lanshare -addr :443 -cert fullchain.pem -key privkey.pem`。
 
+#### 4.1 本地 Nginx + 自定义端口完整示例（以 6001 为例）
+
+`8080` 只是 compose 的默认映射，裸机端口可任意：`-addr` 与 Nginx 的 `proxy_pass` 改成同一个空闲端口即可。下面给出把所有常用参数都显式写出的启动命令（默认无 STUN/TURN → 服务器 WS 完整中继）：
+
+```bash
+./lanshare \
+  -no-tls \
+  -trust-proxy \
+  -addr 127.0.0.1:6001 \
+  -stun-urls '' \
+  -turn-urls '' \
+  -relay-rate 0 \
+  -max-rooms 200 \
+  -max-members 10 \
+  -turn-ttl 3600
+```
+
+各参数含义见「主要参数」表。`-stun-urls '' -turn-urls ''` 可省略（默认即空），显式写出是为了锁定 `noIceServers=true`；`-relay-rate 0` 表示中继不限速，要限速就填 MB/s（如 `20`）。**必须用 `127.0.0.1` 而不是 `:6001`**：开了 `-trust-proxy` 又监听所有网卡时，外部可绕过 Nginx 直连后端并伪造 `X-Forwarded-For`，骗取「同局域网」的房间可见性。
+
+等价的环境变量 / 后台常驻写法：
+
+```bash
+LANSHARE_NO_TLS=1 \
+LANSHARE_TRUST_PROXY=1 \
+LANSHARE_ADDR=127.0.0.1:6001 \
+LANSHARE_STUN_URLS= \
+LANSHARE_TURN_URLS= \
+LANSHARE_RELAY_RATE_MB=0 \
+nohup ./lanshare >> lanshare.log 2>&1 &
+```
+
+对应的 Nginx 站点配置（把 `deploy/nginx.conf.example` 里两处 `proxy_pass` 的 8080 改成 6001；`map` 必须放在 `http{}` 段）：
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name share.example.com;          # 本地可换 localhost 或本机 IP
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name share.example.com;
+
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # 服务端不接收 HTTP 文件上传；WS 升级后是 TCP 流，不受此限制，无需调大
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:6001;
+        proxy_http_version 1.1;
+
+        # 关键 1：Host 须与浏览器 Origin 域名一致，否则 /ws 升级被拒绝
+        proxy_set_header Host               $host;
+        proxy_set_header X-Forwarded-Host   $host;
+        proxy_set_header X-Forwarded-Proto  $scheme;
+
+        # 关键 2：$remote_addr 覆盖，不要用 $proxy_add_x_forwarded_for 追加
+        proxy_set_header X-Forwarded-For    $remote_addr;
+
+        # 关键 3：WebSocket 升级 + 关闭缓冲
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:6001/health;
+        access_log off;
+    }
+}
+```
+
+三个必配项见「反向代理的必配项」。`Host` 的 Origin 校验只比较 hostname，用非标端口（如 `listen 8443`）不影响匹配。本地自签证书（手机访问需装进系统信任，且 SAN 要覆盖实际域名 / 内网 IP，也可用 `mkcert`）：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout privkey.pem -out fullchain.pem \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+只在 `localhost` 单浏览器里试用时，可去掉 TLS 段、直接 `listen 80` 反代到 6001（`localhost` 属于安全上下文），跨设备一律要 HTTPS。Windows 本机把命令换成 `.\lanshare.exe ...`，Nginx 配置放 `conf\nginx.conf`，`proxy_pass` 不变。群晖 DSM 的 `map` 重复定义与配置存放位置见 5.3。
+
+验收：
+
+```bash
+nginx -t && nginx -s reload
+curl -i http://127.0.0.1:6001/health          # 后端直连：{"ok":true,"rooms":0,"peers":0}
+curl -ik https://share.example.com/health     # 经 Nginx：同样的 200
+```
+
+DevTools → Network → WS 应见 `/ws` 返回 `101 Switching Protocols` 且连接保持；`lanshare.log` 不应出现 `ws upgrade rejected ... origin not allowed`。跨网用 4G 设备验证链路显示「中继」且文件可传；防火墙只需放行 `443 tcp`，WS 中继不需要任何 UDP 端口。
+
 ### 5. 群晖 NAS：裸机二进制 + Nginx 反代（DSM 7）
 
 不装 Docker，只在 NAS 上跑一个 `lanshare`，由群晖自带 Nginx 对外提供 HTTPS/WSS。下面以 `/go` 为例，可换成任意目录。
@@ -431,7 +534,7 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 3. Nginx 必须设置 `proxy_set_header X-Forwarded-For $remote_addr;`（**覆盖**而非追加 `$proxy_add_x_forwarded_for`），避免客户端伪造 XFF 骗取同网分组。同时需要 `Upgrade` / `Connection` 头，`/ws` 才能升级。
 4. 群晖 DSM 图形界面生成的反代规则默认用 `$proxy_add_x_forwarded_for`（追加），且 UI 不能改成覆盖；对外服务请按「5.3 写 Nginx 站点配置」自建 `server{}`。另外 DSM 通常已全局定义 `map $http_upgrade $connection_upgrade`，自己的配置里**不要重复定义**，否则 `nginx -t` 报 duplicate。
 
-完整示例见 `deploy/nginx.conf.example`；群晖完整流程见第 5 节。
+完整示例见 `deploy/nginx.conf.example`（默认 8080）；自定义端口的裸机完整示例见 4.1，群晖完整流程见第 5 节。
 
 ---
 
@@ -450,6 +553,8 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 | `-max-rooms` / `-max-members` | — | 200 / 10 | 房间数 / 单房人数 |
 | `-turn-ttl` | — | 3600 | TURN 临时凭据有效期（秒） |
 | `-relay-rate` | `LANSHARE_RELAY_RATE_MB` | `0` | 每连接 WS 数据中继带宽上限（MB/s）；**0 = 不限速**，compose 用 `.env` 的 `RELAY_RATE_MB` |
+
+> 环境变量是各 flag 的默认值来源：显式传入的命令行 flag 优先于环境变量。裸机自定义端口的完整写法见 4.1。
 
 ---
 

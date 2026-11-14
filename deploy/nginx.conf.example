@@ -1,7 +1,9 @@
 # LANShare · Nginx 反代示例（证书完全由 Nginx 提供，后端跑纯 HTTP）
 # 复制为实际站点配置，把 share.example.com 与证书路径换成自己的。
-# 后端固定是 8080：Docker compose 默认映射 "8080:8080"（见 docker-compose.yml），
-# 裸机见 README 第 5 节的 ./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy。
+# 后端默认端口是 8080：Docker compose 默认映射 "8080:8080"（见 docker-compose.yml），
+# 裸机见 README 第 4 节的 ./lanshare -no-tls -addr 127.0.0.1:8080 -trust-proxy。
+# 裸机可用任意空闲端口（完整 6001 示例见 README 4.1）：把下面两处 proxy_pass 的
+# 8080 与启动命令的 -addr 同步修改，且必须绑定 127.0.0.1 而非 :6001 全网监听。
 # 生产环境建议把 compose 的端口映射改成 127.0.0.1:8080:8080 或用防火墙限制，
 # 避免外部绕过 Nginx 直连后端（后端开启了 -trust-proxy，直连可伪造 XFF）。
 #

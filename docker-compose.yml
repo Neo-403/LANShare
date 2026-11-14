@@ -1,12 +1,4 @@
 services:
-  # 只需 docker-compose.yml + .env 即可部署，不需要拉取仓库里的任何脚本或配置。
-  # 默认只需 .env（最小可只含 HTTP_PORT）；PUBLIC_HOST 与 TURN_* 仅启用可选 coturn 时才需要。
-  # ${PUBLIC_HOST}      # 公网域名或 IP（同时用作 TURN realm）
-  # ${TURN_SECRET}      # 可选 coturn 的共享密钥
-  # ${TURN_EXTERNAL_IP} # 可选 coturn 在 NAT 后时的外网 IP
-  # ${STUN_URLS}        # 留空 = 没有外部打洞服务器
-  # ${TURN_URLS}        # 留空 = 不下发外部 TURN
-  # STUN_URLS 与 TURN_URLS 都留空 = 直接启用 LANShare 自身的 WS 完整中继
   lanshare:  # LANShare 服务（页面 + 信令 + 无 TURN 时的 WS 中继）
     # image: 918178/lanshare  # Docker Hub 镜像
     image: ghcr.io/neo-403/lanshare  # GHCR 镜像
@@ -26,45 +18,40 @@ services:
     #   interval: 30s  # 检查间隔
     #   timeout: 3s  # 超时
     #   retries: 3  # 重试次数
-
-  # 可选：只有需要标准 TURN 中继（对称 NAT 且要求最高吞吐）时才启用。
-  # 启用方式：在 .env 里填 TURN_SECRET 与 TURN_URLS，然后
-  #   docker compose --profile turn up -d
-  # 默认的 docker compose up -d 不会启动本服务，也不需要开放任何 UDP 端口。
-  coturn:  # 打洞服务(STUN + TURN)
-    profiles: ["turn"]
-    image: coturn/coturn:4.6.2  # 镜像
-    restart: unless-stopped  # 非手动停止则总是重启
-    entrypoint:  # 启动命令（内联，无需挂载仓库脚本）
-      - /bin/sh
-      - -c
-      - |
-        set -eu
-        : "$${TURN_SECRET}"
-        : "$${PUBLIC_HOST}"
-        set -- \
-          --log-file stdout \
-          --listening-port 3478 \
-          --min-port 40000 \
-          --max-port 40200 \
-          --fingerprint \
-          --use-auth-secret \
-          --static-auth-secret "$$TURN_SECRET" \
-          --realm "$$PUBLIC_HOST" \
-          --no-tls \
-          --no-dtls \
-          --no-cli \
-          --no-multicast-peers \
-          --mobility
-        if [ -n "$${TURN_EXTERNAL_IP:-}" ]; then
-          set -- "$$@" --external-ip "$$TURN_EXTERNAL_IP"
-        fi
-        exec turnserver "$$@"
-    ports:  # 端口映射
-      - "3478:3478/udp"  # 3478 UDP
-      - "3478:3478/tcp"  # 3478 TCP
-      - "40000-40200:40000-40200/udp"  # 中继端口段(适当收窄,避免过多规则)
-    environment:  # 环境变量
-      TURN_SECRET: "${TURN_SECRET:-}"  # TURN 密钥(和 LANSHARE_TURN_SECRET 保持一致)
-      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}  # 外网 IP
-      PUBLIC_HOST: ${PUBLIC_HOST:-}  # 启用 TURN profile 时必填：公网域名或 IP
+  # coturn:  # 打洞服务(STUN + TURN)
+  #   profiles: ["turn"]
+  #   image: coturn/coturn:4.6.2  # 镜像
+  #   restart: unless-stopped  # 非手动停止则总是重启
+  #   entrypoint:  # 启动命令（内联，无需挂载仓库脚本）
+  #     - /bin/sh
+  #     - -c
+  #     - |
+  #       set -eu
+  #       : "$${TURN_SECRET}"
+  #       : "$${PUBLIC_HOST}"
+  #       set -- \
+  #         --log-file stdout \
+  #         --listening-port 3478 \
+  #         --min-port 40000 \
+  #         --max-port 40200 \
+  #         --fingerprint \
+  #         --use-auth-secret \
+  #         --static-auth-secret "$$TURN_SECRET" \
+  #         --realm "$$PUBLIC_HOST" \
+  #         --no-tls \
+  #         --no-dtls \
+  #         --no-cli \
+  #         --no-multicast-peers \
+  #         --mobility
+  #       if [ -n "$${TURN_EXTERNAL_IP:-}" ]; then
+  #         set -- "$$@" --external-ip "$$TURN_EXTERNAL_IP"
+  #       fi
+  #       exec turnserver "$$@"
+  #   ports:  # 端口映射
+  #     - "3478:3478/udp"  # 3478 UDP
+  #     - "3478:3478/tcp"  # 3478 TCP
+  #     - "40000-40200:40000-40200/udp"  # 中继端口段(适当收窄,避免过多规则)
+  #   environment:  # 环境变量
+  #     TURN_SECRET: "${TURN_SECRET:-}"  # TURN 密钥(和 LANSHARE_TURN_SECRET 保持一致)
+  #     TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}  # 外网 IP
+  #     PUBLIC_HOST: ${PUBLIC_HOST:-}  # 启用 TURN profile 时必填：公网域名或 IP
