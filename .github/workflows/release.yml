@@ -4,8 +4,8 @@ name: Build · Release · Docker
 #
 # 触发与行为：
 #   push tag v*        → 交叉编译二进制 + 创建 GitHub Release + 推送镜像（版本标签 + latest）
-#   push main          → 交叉编译二进制（仅 artifact）+ 推送镜像（main / sha-xxxxxxx）
 #   workflow_dispatch  → 手动运行；填 version 可额外创建 Release，勾 push_latest 可打 latest
+#   普通 push（提交到分支）不触发，避免「一次提交 + 一次 tag」跑两遍构建。
 #
 # 版本号来自 tag：必须 v 开头且符合语义化版本（vMAJOR.MINOR.PATCH），
 # 镜像标签由 type=semver 去掉 v 后生成；手动运行的 version 输入只影响 Release 名。
@@ -20,8 +20,8 @@ name: Build · Release · Docker
 # 未配置 Docker Hub 凭据时自动跳过该推送，GHCR 仍正常发布。
 
 on:
+  # 只有打了 v* 标签才自动构建；普通提交推送不触发。
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -62,18 +62,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          go version
+          # 每个目标用独立的 KEY=VALUE 参数交给 env：不靠空格位置区分 GOARCH /
+          # GOARM，避免被写成 arm7 这类无效 GOARCH；非 ARM 目标完全不设 GOARM。
           build() {
-            local out="$1" goos="$2" goarch="$3" goarm="${4:-}"
-            echo "::group::build $out (GOOS=$goos GOARCH=$goarch GOARM=$goarm)"
-            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" \
-              go build -trimpath -ldflags="-s -w" -o "dist/$out" .
+            local out="$1"; shift
+            echo "::group::build $out ($*)"
+            env CGO_ENABLED=0 "$@" go build -trimpath -ldflags="-s -w" -o "dist/$out" .
             echo "::endgroup::"
           }
-          build lanshare-windows-amd64.exe windows amd64
-          build lanshare-windows-arm64.exe windows arm64
-          build lanshare-linux-amd64        linux   amd64
-          build lanshare-linux-arm64        linux   arm64
-          build lanshare-linux-armv7        linux   arm7
+          build lanshare-windows-amd64.exe GOOS=windows GOARCH=amd64
+          build lanshare-windows-arm64.exe GOOS=windows GOARCH=arm64
+          build lanshare-linux-amd64        GOOS=linux   GOARCH=amd64
+          build lanshare-linux-arm64        GOOS=linux   GOARCH=arm64
+          build lanshare-linux-armv7        GOOS=linux   GOARCH=arm GOARM=7
           cd dist
           sha256sum lanshare-* > SHA256SUMS.txt
           ls -lh
@@ -168,7 +170,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=ref,event=branch
             type=sha,format=short
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.push_latest) }}
 

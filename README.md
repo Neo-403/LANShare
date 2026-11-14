@@ -49,11 +49,12 @@ head -c 4 lanshare | od -An -tx1           # 7f 45 4c 46 = ELF；4d 5a = Windows
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) 每次都从当前源码重新构建，不使用本地产物。
 
+**普通提交推送（push 到分支）不会触发构建**，只有打了 `v*` 标签或在 Actions 页面手动运行才会构建 —— 避免「一次提交 + 一次 tag」跑两遍。
+
 | 触发 | 二进制 artifact | GitHub Release | 镜像标签 |
 |---|---|---|---|
-| `push` tag `v*` | ✅ | ✅ 附带全部平台二进制 + `SHA256SUMS.txt` | `1.2.3` / `1.2` / `latest` |
-| `push` `main` | ✅ | — | `main` / `sha-xxxxxxx` |
-| 手动运行 workflow | ✅ | 填 `version` 才创建 | 可勾选 `push_latest` |
+| `push` tag `v*` | ✅ | ✅ 附带全部平台二进制 + `SHA256SUMS.txt` | `1.2.3` / `1.2` / `latest` / `sha-xxxxxxx` |
+| 手动运行 workflow | ✅ | 填 `version` 才创建 | `sha-xxxxxxx`（可勾 `push_latest` 加 `latest`） |
 
 Release 产物（文件名固定，便于脚本 / 文档用固定链接）：
 
@@ -83,7 +84,7 @@ Release 产物（文件名固定，便于脚本 / 文档用固定链接）：
 
 #### 版本标签与发版
 
-自动构建的版本号来自 git tag：**必须 `v` 开头且符合语义化版本**（`vMAJOR.MINOR.PATCH`）。推送 tag 会同时触发 Release 与镜像构建。
+自动构建的版本号来自 git tag：**必须 `v` 开头且符合语义化版本**（`vMAJOR.MINOR.PATCH`）。推送 tag 会同时触发 Release 与镜像构建；下面第一步的 `git push origin main` 只是让 tag 指向远端已存在的提交，本身不会触发 workflow。
 
 ```bash
 git status --short  # 检查状态
@@ -108,7 +109,7 @@ git push origin v1.2.3  # 精确推送这一个标签
 - tag 含 `-`（如 `v1.2.3-rc1`）时 Release 自动标记为预发布，镜像标签为 `1.2.3-rc1`。
 - 打错版本号建议直接换新号；确需删除：`git tag -d v1.2.3` + `git push --delete origin v1.2.3`。同名 tag 再次 push 会重跑构建并覆盖已有 Release 附件。
 
-**手动运行 workflow 的区别**：`workflow_dispatch` 的 `version` 输入只用于创建名为该值的 Release（`tag_name`），**镜像拿不到版本号标签** —— `type=semver` 只认 tag 事件，手动运行时镜像仅有 `main` / `sha-xxxxxxx`（勾 `push_latest` 会多一个 `latest`）。要让镜像带版本号必须走 git tag。
+**手动运行 workflow 的区别**：`workflow_dispatch` 的 `version` 输入只用于创建名为该值的 Release（`tag_name`），**镜像拿不到版本号标签** —— `type=semver` 只认 tag 事件，手动运行时镜像仅有 `sha-xxxxxxx`（勾 `push_latest` 会多一个 `latest`）。要让镜像带版本号必须走 git tag。
 
 **版本号不写入二进制**：构建参数是 `-ldflags="-s -w"`，程序没有版本变量也没有 `-version`，版本号只体现在 Release 与镜像标签上。
 
