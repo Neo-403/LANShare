@@ -306,7 +306,7 @@ export class UI extends Emitter {
         <div class="factions"><button class="btn btn-sm btn-primary" data-action="accept" data-fid="${escapeHTML(f.fid)}">接收</button></div>`;
     } else return;
     this.el.messages.appendChild(wrap);
-    if (item.t === 'file_offer' && this.file) this.updateTransfer(this.file.get(f.fid));
+    if (item.t === 'file_offer' && this.file) this.updateTransfer(this.file.get(item.file.fid));
     this.scroll();
   }
 

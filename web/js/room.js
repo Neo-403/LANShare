@@ -168,8 +168,11 @@ export class RoomState extends Emitter {
     const peers = this.mesh.list();
     const down = peers.length > 0 && peers.every(p =>
       p.link === 'failed' || p.link === 'disconnected' || p.link === 'closed');
-    const stalled = !!this.mesh.ice?.noIceServers && this.stalled &&
-      peers.length > 0 && peers.every(p => !p.ready);
+    // noIceServers 下，任一 peer 无法建立 P2P（跨网无候选）就必须整屋走服务器中继，
+    // 否则这些不可达 peer 收不到任何消息/文件（内网 P2P 链路无法把数据送达跨网 peer）。
+    // 纯内网房间所有 peer 都可达，仍走直连，不影响内网性能。
+    const unreachable = peers.length > 0 && peers.some(p => !p.ready);
+    const stalled = !!this.mesh.ice?.noIceServers && this.stalled && unreachable;
     const next = down || stalled;
     if (next !== this.wsOnly) {
       this.wsOnly = next;

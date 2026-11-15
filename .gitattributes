@@ -1,2 +1,5 @@
 deploy/*.sh text eol=lf
 Dockerfile text eol=lf
+*.syso binary
+*.ico binary
+*.png binary

@@ -13,6 +13,23 @@ go build -o lanshare.exe .        # Windows
 
 零第三方依赖，编译产物只有一个可执行文件（静态页面已 `go:embed` 内置）。
 
+### 图标
+
+网页标签与 Windows `lanshare.exe` 共用顶栏的 **LS** 徽标（`#2563eb` 圆角方块 + 白色 LS）：
+
+| 文件 | 用途 |
+|---|---|
+| `web/favicon.svg` / `web/favicon.ico` / `web/apple-touch-icon.png` | 浏览器标签、书签、iOS 桌面图标；由 `//go:embed all:web` 自动提供，无需额外路由 |
+| `rsrc_windows_amd64.syso` / `rsrc_windows_arm64.syso` | Windows exe 的图标资源；Go 在 `GOOS=windows` 时按文件名后缀自动链接，Linux / macOS / 容器构建会忽略 |
+
+改图标只需编辑 `tools/mkicon/main.go` 顶部的 `glyph` / `corner` / `blue`，再在项目根目录重新生成并提交（纯标准库，无需 `rsrc` / `windres` 等外部工具）：
+
+```bash
+go generate ./...     # 等价于 go run ./tools/mkicon
+```
+
+CI 与 Docker 构建直接使用仓库中的生成物，不运行生成器。
+
 ### 交叉编译到 NAS（Linux）
 
 `go:embed` 把**构建时磁盘上的** `web/` 一起打进二进制；改过前端必须重新编译并替换 NAS 上的文件，只更新 `web/` 无效。
@@ -242,6 +259,10 @@ LANSHARE_TURN_URLS='turn:share.example.com:3478?transport=udp,turn:share.example
   -max-rooms 200 \
   -max-members 10 \
   -turn-ttl 3600
+
+# 查看Docker Nginx网关,开放的地址设为网关地址,并且Nginx中服务地址也配置为该网关地址
+docker inspect <nginx容器名> --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.Gateway}}{{end}}'
+# 或 ip addr show docker0 | grep inet     → 常见 172.17.0.1
 ```
 
 各参数含义见「主要参数」表。`-stun-urls '' -turn-urls ''` 可省略（默认即空），显式写出是为了锁定 `noIceServers=true`；`-relay-rate 0` 表示中继不限速，要限速就填 MB/s（如 `20`）。**必须用 `127.0.0.1` 而不是 `:6001`**：开了 `-trust-proxy` 又监听所有网卡时，外部可绕过 Nginx 直连后端并伪造 `X-Forwarded-For`，骗取「同局域网」的房间可见性。
@@ -533,6 +554,23 @@ curl -i https://share.example.com/health      # 经 Nginx：200 + 同样的 JSON
 2. Nginx 必须设置 `proxy_set_header Host $host;`：WS 升级会校验 `Origin`，Host 与浏览器域名不一致会被拒绝。也支持 `X-Forwarded-Host`。
 3. Nginx 必须设置 `proxy_set_header X-Forwarded-For $remote_addr;`（**覆盖**而非追加 `$proxy_add_x_forwarded_for`），避免客户端伪造 XFF 骗取同网分组。同时需要 `Upgrade` / `Connection` 头，`/ws` 才能升级。
 4. 群晖 DSM 图形界面生成的反代规则默认用 `$proxy_add_x_forwarded_for`（追加），且 UI 不能改成覆盖；对外服务请按「5.3 写 Nginx 站点配置」自建 `server{}`。另外 DSM 通常已全局定义 `map $http_upgrade $connection_upgrade`，自己的配置里**不要重复定义**，否则 `nginx -t` 报 duplicate。
+
+#### 反代排错：房间列表跨网互见（真实客户端 IP 被替换）
+
+现象：外网（不同网络）的客户端能在房间列表里直接看到其它网络的房间，违反「列表仅显示同局域网」的预期。建房的日志 `scope=` 形如 `approx|172.20.0.1|?`（或某个 Docker 网桥 / 网关地址），而不是客户端的真实公网 IP。
+
+根因：房间列表按 `scope = approx|<客户端公网IP>|<私网/24>` 分组（`room.go` 的 `scopeKey` / `sameScope`）。跨网能否区分完全取决于 `<客户端公网IP>` 是否真实。若 lanshare 拿到的全是代理 / 网关地址，所有客户端会塌进同一个 IP；再叠加外部客户端无私网段时 `lan="?"` 的通配符（`sameScope` 把 `lan=="?` 视为同组），就会全员互见。
+
+拿到真实 IP 需要**两个条件同时成立**：① lanshare 带 `-trust-proxy`（否则内部退化用 `r.RemoteAddr` 即反代地址）；② 反代把真实客户端 IP 写进 `X-Forwarded-For`。
+
+最常见的「条件 ② 不成立」正是 **Docker 端口发布（docker-proxy / userland-proxy）**：`netstat -tlnp | grep 443` 看到监听者是 `docker-proxy` 时，容器里 `$remote_addr` 是宿主机网桥地址（如 `172.20.0.1`），真实客户端 IP 在 docker-proxy 这一跳被替换。此时即便 Nginx 配了 `X-Forwarded-For $remote_addr`，写进去的也是网关地址；改成 `$proxy_add_x_forwarded_for` 也没用——链路里根本没有真实 IP。`172.20.0.1` 就是这么来的。
+
+修复（纯部署，不动 lanshare 代码）：
+
+- **方案 A（推荐）**：让 Nginx 容器用 `network_mode: host` 并去掉 `ports:` 映射。Nginx 直接绑在宿主机端口，`$remote_addr` 即真实客户端 IP；`proxy_pass` 仍指向 lanshare 监听地址（如 `http://172.20.0.1:6001`）。只重启 Nginx 容器即可。
+- **方案 B**：关闭 Docker userland-proxy，让发布端口走内核 DNAT 保留真实源 IP。`/etc/docker/daemon.json` 加 `{"userland-proxy": false}` 后重启 Docker 守护进程；原有 bridge 配置不动。
+
+验证：修复后用外网设备建一个房，`lanshare.log` 的 `scope=` 应变成 `approx|<真实公网IP>|?`；不同 4G 网络的设备应**互不可见**（只能凭房间号加入）。仍未拿到真实 IP 时，先 `ps` 确认运行中的进程确实带 `-trust-proxy`，再用 `nginx -T` 确认实际加载的配置含 `X-Forwarded-For`，最后看 `scope=` 落在哪个 IP。
 
 完整示例见 `deploy/nginx.conf.example`（默认 8080）；自定义端口的裸机完整示例见 4.1，群晖完整流程见第 5 节。
 
